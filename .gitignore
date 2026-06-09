@@ -1,0 +1,27 @@
+# Binaries
+/aegis
+/aegis.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+internal/crypto/*.test
+internal/p2p/*.test
+internal/transfer/*.test
+internal/tui/*.test
+
+# Temp folders and caches
+tmp/
+temp/
+*~
+.go/
+
+# IDE and System Files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
