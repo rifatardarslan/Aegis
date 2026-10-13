@@ -16,7 +16,7 @@ cd Aegis
 go run ./cmd/aegis
 ```
 
-Linux/macOS üzerinde `./install.sh`, Windows üzerinde `install.bat` çalıştırabilirsiniz. Kurulum önce kaynaktan derlemeyi dener; başarısız olursa işletim sistemi ve mimariye uygun binary ile `SHA256SUMS` içeren bir GitHub sürümünü indirir. İndirme veya checksum doğrulaması başarısızsa kurulum tamamlanmış sayılmaz. Böyle bir sürüm yayımlanana kadar kaynaktan derleyin. Linux/macOS kurulumu `~/.local/bin` dizinine yapılır; gerekirse PATH'e ekleyin. Windows kurulumu `%USERPROFILE%\.aegis\bin` dizinine yapılır ve kullanıcı PATH'i güncellenir.
+Linux/macOS üzerinde `./install.sh`, Windows üzerinde `install.bat` çalıştırabilirsiniz. Kurulum önce kaynaktan derlemeyi dener; başarısız olursa işletim sistemi ve mimariye uygun binary ile `SHA256SUMS` içeren bir GitHub sürümünü indirir. İndirme veya checksum doğrulaması başarısızsa kurulum tamamlanmış sayılmaz. Böyle bir sürüm yayımlanana kadar kaynaktan derleyin. Linux/macOS kurulumu `~/.local/bin` dizinine yapılır ve Bash, Zsh veya Fish başlangıç ayarına PATH satırı otomatik eklenir. Kurulumdan sonra yeni terminal açıp `aegis` çalıştırabilirsiniz. Diğer kabuklarda `~/.profile` kullanılır. Windows kurulumu `%USERPROFILE%\.aegis\bin` dizinine yapılır ve kullanıcı PATH'i güncellenir.
 
 ## Geçici görüşme
 

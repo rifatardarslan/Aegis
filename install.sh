@@ -49,6 +49,18 @@ fi
 
 aegis_install_dir="${AEGIS_INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$aegis_install_dir"
+aegis_install_dir="$(cd "$aegis_install_dir" && pwd -P)"
 install -m 0755 "$aegis_tmp/aegis" "$aegis_install_dir/aegis"
 echo "Installed: $aegis_install_dir/aegis"
-case ":$PATH:" in *":$aegis_install_dir:"*) ;; *) echo 'Add "$HOME/.local/bin" to PATH, or run ~/.local/bin/aegis.';; esac
+# An executed installer cannot change its parent terminal environment.
+# Configure future shells, then explain how to pick up the change.
+source ./scripts/configure-path.sh
+aegis_profile_root="${AEGIS_PROFILE_DIR:-$HOME}"
+aegis_shell_name="${SHELL:-/bin/sh}"
+aegis_shell_name="${aegis_shell_name##*/}"
+if [ "$aegis_shell_name" = zsh ] && [ -z "${AEGIS_PROFILE_DIR:-}" ]; then
+    aegis_profile_root="${ZDOTDIR:-$HOME}"
+fi
+aegis_config_root="${AEGIS_CONFIG_DIR:-${XDG_CONFIG_HOME:-$aegis_profile_root/.config}}"
+aegis_configure_path "$aegis_profile_root" "$aegis_install_dir" "${SHELL:-/bin/sh}" "$aegis_config_root"
+echo 'Installation complete. Open a new terminal and run: aegis'

@@ -16,7 +16,7 @@ cd Aegis
 go run ./cmd/aegis
 ```
 
-Or run `./install.sh` on Linux/macOS, or `install.bat` on Windows. Installers try a local build first and can fall back to a release containing an architecture-specific binary and `SHA256SUMS`. They fail if the download or checksum verification fails. Until such a release is published, install from source. Linux/macOS installs into `~/.local/bin`; add that directory to PATH if needed. Windows installs into `%USERPROFILE%\.aegis\bin` and updates the user PATH.
+Or run `./install.sh` on Linux/macOS, or `install.bat` on Windows. Installers try a local build first and can fall back to a release containing an architecture-specific binary and `SHA256SUMS`. They fail if the download or checksum verification fails. Until such a release is published, install from source. Linux/macOS installs into `~/.local/bin` and adds it to your Bash, Zsh or Fish startup configuration. Open a new terminal after installation to run `aegis`. Other shells use `~/.profile`. Windows installs into `%USERPROFILE%\.aegis\bin` and updates the user PATH.
 
 ## A temporary conversation
 

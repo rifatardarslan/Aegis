@@ -39,7 +39,9 @@ jobs:
 
     - name: Check Unix installer syntax
       shell: bash
-      run: bash -n install.sh
+      run: |
+        bash -n install.sh
+        bash -n scripts/configure-path.sh
 
     - name: Check Windows installer syntax
       if: runner.os == 'Windows'
