@@ -214,3 +214,21 @@ func TestInvalidPackets(t *testing.T) {
 		}
 	}
 }
+
+func TestSaveAndSnapshotConcurrent(t *testing.T) {
+	a, b := &Engine{}, &Engine{}
+	defer a.Close()
+	defer b.Close()
+	transferPair(t, a, b)
+	done := make(chan error, 1)
+	go func() { _, err := b.Save(filepath.Join(t.TempDir(), "saved.dat"), false); done <- err }()
+	for i := 0; i < 100; i++ {
+		_ = b.Snapshot()
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if b.Snapshot().Current != b.Snapshot().Total {
+		t.Fatal("completed progress was lost")
+	}
+}

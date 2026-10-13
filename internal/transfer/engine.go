@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"github.com/aegis-p2p/aegis/internal/crypto"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -70,6 +71,7 @@ func (u *Upload) Close() {
 }
 
 type download struct {
+	digest             hash.Hash
 	offer              AegisFrame
 	data               []byte
 	chunks             int
@@ -89,6 +91,7 @@ type Engine struct {
 	recv      *download
 	current   int
 	waiting   bool
+	saving    bool
 	state     string
 	lastID    string
 	lastName  string
@@ -159,6 +162,7 @@ func (e *Engine) Accept(accept bool) (AegisFrame, error) {
 		return AegisFrame{Type: TypeFileReject, TransferID: id}, nil
 	}
 	e.recv.accepted = true
+	e.recv.digest = sha256.New()
 	e.recv.data = make([]byte, 0, e.recv.offer.Size)
 	e.state = "receiving"
 	e.activity = time.Now()
@@ -166,26 +170,36 @@ func (e *Engine) Accept(accept bool) (AegisFrame, error) {
 }
 func (e *Engine) NextChunk() (AegisFrame, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.upload == nil || e.state != "sending" || e.waiting {
+		e.mu.Unlock()
 		return AegisFrame{}, fmt.Errorf("transfer no longer sending")
 	}
+	u, index := e.upload, e.current
 	size := int64(ChunkSize)
-	offset := int64(e.current) * ChunkSize
-	if remaining := e.upload.Size - offset; remaining < size {
+	offset := int64(index) * ChunkSize
+	if remaining := u.Size - offset; remaining < size {
 		size = remaining
 	}
 	if size <= 0 {
+		e.mu.Unlock()
 		return AegisFrame{}, fmt.Errorf("invalid chunk offset")
-	}
-	buf := make([]byte, size)
-	if _, err := io.ReadFull(io.NewSectionReader(e.upload.file, offset, size), buf); err != nil {
-		crypto.Bytes(buf)
-		return AegisFrame{}, err
 	}
 	e.waiting = true
 	e.activity = time.Now()
-	return AegisFrame{Type: TypeChunk, TransferID: e.upload.ID, Index: e.current, Data: buf}, nil
+	e.mu.Unlock()
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(io.NewSectionReader(u.file, offset, size), buf); err != nil {
+		crypto.Bytes(buf)
+		return AegisFrame{}, err
+	}
+	e.mu.Lock()
+	valid := e.upload == u && e.state == "sending" && e.current == index
+	e.mu.Unlock()
+	if !valid {
+		crypto.Bytes(buf)
+		return AegisFrame{}, fmt.Errorf("transfer cancelled")
+	}
+	return AegisFrame{Type: TypeChunk, TransferID: u.ID, Index: index, Data: buf}, nil
 }
 
 // Handle returns response frames and whether a background chunk read is needed.
@@ -269,6 +283,7 @@ func (e *Engine) Handle(f AegisFrame) ([]AegisFrame, bool, error) {
 				return nil, false, fmt.Errorf("invalid chunk length")
 			}
 			e.recv.data = append(e.recv.data, f.Data...)
+			_, _ = e.recv.digest.Write(f.Data)
 			e.recv.chunks++
 			e.activity = time.Now()
 			return []AegisFrame{{Type: TypeChunkAck, TransferID: f.TransferID, Index: f.Index}}, false, nil
@@ -276,8 +291,8 @@ func (e *Engine) Handle(f AegisFrame) ([]AegisFrame, bool, error) {
 			if !e.recv.accepted || e.recv.verified || e.recv.chunks != e.recv.offer.Chunks || int64(len(e.recv.data)) != e.recv.offer.Size {
 				return nil, false, fmt.Errorf("incomplete transfer")
 			}
-			hash := sha256.Sum256(e.recv.data)
-			if hex.EncodeToString(hash[:]) != e.recv.offer.SHA256 || f.SHA256 != e.recv.offer.SHA256 {
+			digest := e.recv.digest.Sum(nil)
+			if hex.EncodeToString(digest) != e.recv.offer.SHA256 || f.SHA256 != e.recv.offer.SHA256 {
 				id := f.TransferID
 				e.clearLocked()
 				e.state = "integrity check failed"
@@ -293,20 +308,33 @@ func (e *Engine) Handle(f AegisFrame) ([]AegisFrame, bool, error) {
 }
 func (e *Engine) Save(path string, overwrite bool) (AegisFrame, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.recv == nil || !e.recv.verified {
-		return AegisFrame{}, fmt.Errorf("no verified file to save")
+	if e.recv == nil || !e.recv.verified || e.saving {
+		e.mu.Unlock()
+		return AegisFrame{}, fmt.Errorf("no verified file available to save")
 	}
+	received := e.recv
+	// The save owns a bounded copy so cancellation can clear the reception buffer.
+	data := append([]byte(nil), received.data...)
+	e.saving = true
+	e.mu.Unlock()
+	defer crypto.Bytes(data)
 	if info, err := os.Stat(path); err == nil && info.IsDir() {
-		path = filepath.Join(path, e.recv.offer.Name)
+		path = filepath.Join(path, received.offer.Name)
 	}
-	if err := SaveFileWithOverwrite(path, e.recv.data, overwrite); err != nil {
+	err := SaveFileWithOverwrite(path, data, overwrite)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.recv == received {
+		e.saving = false
+		if err == nil {
+			e.clearLocked()
+			e.state = "saved locally"
+		}
+	}
+	if err != nil {
 		return AegisFrame{}, err
 	}
-	id := e.recv.offer.TransferID
-	e.clearLocked()
-	e.state = "saved locally"
-	return AegisFrame{Type: TypeFileSaved, TransferID: id}, nil
+	return AegisFrame{Type: TypeFileSaved, TransferID: received.offer.TransferID}, nil
 }
 func (e *Engine) Cancel() AegisFrame {
 	e.mu.Lock()
@@ -333,9 +361,11 @@ func (e *Engine) clearLocked() {
 		e.upload = nil
 	}
 	if e.recv != nil {
+		e.current = e.recv.chunks
 		crypto.Bytes(e.recv.data)
 		e.recv = nil
 	}
 	e.waiting = false
+	e.saving = false
 }
 func (e *Engine) Close() { e.mu.Lock(); defer e.mu.Unlock(); e.clearLocked() }
