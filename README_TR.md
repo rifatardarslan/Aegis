@@ -1,8 +1,10 @@
 # Aegis
 
+**Dil / Language:** [English](README.md) | [**Türkçe**](README_TR.md)
+
 Geçici, şifreli birebir görüşmeler ve dosya paylaşımı için terminal uygulaması. Geçici bir ad seçin, karşı tarafı Aegis içinde arayın ve bağlantı isteğini kabul edin. Hesap, parola veya bağlantı adreslerini iletmek için başka bir uygulama gerekmez.
 
-[English](README.md) · [Güvenlik politikası](SECURITY.md) · MIT lisansı
+[Güvenlik politikası](SECURITY.md) · MIT lisansı
 
 ## Başlangıç
 

@@ -1,8 +1,10 @@
 # Aegis
 
+**Language / Dil:** [**English**](README.md) | [Türkçe](README_TR.md)
+
 A terminal messenger for temporary, encrypted, one-to-one conversations and file sharing. Choose a temporary name, find the other person inside Aegis, and accept a connection request. No account, password, or external app is required to exchange connection addresses.
 
-[Türkçe](README_TR.md) · [Security policy](SECURITY.md) · MIT license
+[Security policy](SECURITY.md) · MIT license
 
 ## Getting started
 
