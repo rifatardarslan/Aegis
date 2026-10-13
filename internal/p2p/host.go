@@ -2,10 +2,8 @@ package p2p
 
 import (
 	"context"
-	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
-
-	"golang.org/x/crypto/argon2"
 
 	"time"
 
@@ -18,38 +16,22 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	libp2pws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/multiformats/go-multiaddr"
-
-	aegiscrypto "github.com/aegis-p2p/aegis/internal/crypto"
 )
 
-// DeriveHostKey generates a deterministic Ed25519 private key from the given
-// passphrase using Argon2id.
-func DeriveHostKey(passphrase string) (crypto.PrivKey, error) {
-	// NOTE: Passphrase zeroization is handled by the caller (initP2PCmd) at the boundary layer.
-	// Do NOT zero passphrase here — Go strings share backing arrays, so zeroizing the local
-	// copy would corrupt the caller's copy if they need to use it again.
-
-	// Argon2id parameters:
-	// - time: 3 iterations
-	// - memory: 64 MB (64 * 1024 KB)
-	// - threads (parallelism): 4
-	// - keyLen: 32 bytes (for Ed25519 seed)
-	// Salt is static and memory-only.
-	salt := []byte("aegis-deterministic-libp2p-salt-v1")
-	passBytes := []byte(passphrase)
-	defer aegiscrypto.Bytes(passBytes)
-	seed := argon2.IDKey(passBytes, salt, 3, 64*1024, 4, 32)
-	defer aegiscrypto.Bytes(seed)
-
-	stdPriv := ed25519.NewKeyFromSeed(seed)
-	return crypto.UnmarshalEd25519PrivateKey(stdPriv)
-}
-
-// NewHost creates a new libp2p host deterministically derived from a passphrase.
-func NewHost(ctx context.Context, passphrase string, customRelayAddr string) (host.Host, error) {
-	privKey, err := DeriveHostKey(passphrase)
+// NewHost creates an ephemeral libp2p identity. Names never derive private keys.
+func NewHost(ctx context.Context, customRelayAddr string) (host.Host, error) {
+	privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to derive host key: %w", err)
+		return nil, fmt.Errorf("generate host identity: %w", err)
+	}
+	if customRelayAddr != "" {
+		ma, err := multiaddr.NewMultiaddr(customRelayAddr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid relay: %w", err)
+		}
+		if _, err := peer.AddrInfoFromP2pAddr(ma); err != nil {
+			return nil, fmt.Errorf("invalid relay: %w", err)
+		}
 	}
 
 	relays := GetRelayAddrInfos()
@@ -75,11 +57,11 @@ func NewHost(ctx context.Context, passphrase string, customRelayAddr string) (ho
 		libp2p.NATPortMap(),
 		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithStaticRelays(relays,
-			autorelay.WithNumRelays(1),       // only 1 relay needed — default was 4 (= all static nodes)
-			autorelay.WithMinCandidates(1),   // start trying immediately with 1 candidate
-			autorelay.WithBootDelay(0),       // no initial wait — default was 3 minutes
-			autorelay.WithBackoff(5*time.Minute),      // retry each failed node after 5m, not 1 hour/30s
-			autorelay.WithMinInterval(5*time.Minute),  // re-query peer source every 5m
+			autorelay.WithNumRelays(1),               // only 1 relay needed — default was 4 (= all static nodes)
+			autorelay.WithMinCandidates(1),           // start trying immediately with 1 candidate
+			autorelay.WithBootDelay(0),               // no initial wait — default was 3 minutes
+			autorelay.WithBackoff(5*time.Minute),     // retry each failed node after 5m, not 1 hour/30s
+			autorelay.WithMinInterval(5*time.Minute), // re-query peer source every 5m
 		),
 		libp2p.EnableNATService(),
 		// Force private-reachability mode so auto-relay always establishes

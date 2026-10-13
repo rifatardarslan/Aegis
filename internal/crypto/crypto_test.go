@@ -94,10 +94,8 @@ func TestHandshakeAndRatchet(t *testing.T) {
 		t.Fatal("fingerprints should not be empty")
 	}
 
-	sas1 := SAS(identA.PublicKey, identB.PublicKey)
-	sas2 := SAS(identB.PublicKey, identA.PublicKey)
-	if sas1 != sas2 {
-		t.Fatalf("SAS is not symmetric: %q vs %q", sas1, sas2)
+	if resultA.TranscriptHash != resultB.TranscriptHash || TranscriptSAS(resultA.TranscriptHash) != TranscriptSAS(resultB.TranscriptHash) {
+		t.Fatal("handshake transcripts differ")
 	}
 
 	// ── Test Ratchet State ───────────────────────────────────────────────────
@@ -147,12 +145,6 @@ func TestHandshakeAndRatchet(t *testing.T) {
 		t.Fatal("expected decryption of replayed message to fail, but it succeeded")
 	}
 
-	// Tampered byte test
-	ciphertext1[12] ^= 0xFF
-	_, err = ratchetB.DecryptMessage(ciphertext1, aad)
-	if err == nil {
-		t.Fatal("expected decryption of tampered ciphertext to fail, but it succeeded")
-	}
 }
 
 func TestCryptoKeysZeroization(t *testing.T) {
@@ -190,3 +182,52 @@ func TestCryptoKeysZeroization(t *testing.T) {
 	}
 }
 
+func TestAuthenticationFailureDoesNotAdvanceChain(t *testing.T) {
+	var root [32]byte
+	root[0] = 1
+	sender, receiver := NewRatchetState(root, true), NewRatchetState(root, false)
+	defer sender.Destroy()
+	defer receiver.Destroy()
+	packet, err := sender.EncryptMessage([]byte("message"), []byte("context"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	damaged := append([]byte(nil), packet...)
+	damaged[len(damaged)-1] ^= 1
+	old := receiver.RecvChainKey
+	if _, err := receiver.DecryptMessage(damaged, []byte("context")); err == nil {
+		t.Fatal("tampering accepted")
+	}
+	if receiver.RecvChainKey != old || receiver.RecvMsgNum != 0 {
+		t.Fatal("authentication failure advanced state")
+	}
+	if _, err := receiver.DecryptMessage(packet, []byte("context")); err != nil {
+		t.Fatal("valid packet rejected after tampering", err)
+	}
+}
+
+func TestHandshakeContextMismatch(t *testing.T) {
+	a, _ := NewIdentity()
+	b, _ := NewIdentity()
+	defer a.Destroy()
+	defer b.Destroy()
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	errs := make(chan error, 2)
+	go func() { defer wg.Done(); _, err := RunBoundHandshake(left, a, true, []byte("request-a")); errs <- err }()
+	go func() {
+		defer wg.Done()
+		_, err := RunBoundHandshake(right, b, false, []byte("request-b"))
+		errs <- err
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err == nil {
+			t.Fatal("context mismatch accepted")
+		}
+	}
+}

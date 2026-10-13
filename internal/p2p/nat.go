@@ -59,3 +59,15 @@ func GetRelayAddrInfos() []peer.AddrInfo {
 	}
 	return infos
 }
+
+func relayAddrInfos(custom string) []peer.AddrInfo {
+	infos := GetRelayAddrInfos()
+	if custom != "" {
+		if ma, err := multiaddr.NewMultiaddr(custom); err == nil {
+			if info, err := peer.AddrInfoFromP2pAddr(ma); err == nil {
+				infos = append([]peer.AddrInfo{*info}, infos...)
+			}
+		}
+	}
+	return infos
+}

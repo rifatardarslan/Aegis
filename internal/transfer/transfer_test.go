@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -59,6 +60,9 @@ func TestSaveFilePermissions(t *testing.T) {
 	}
 
 	// Mode Perm on Windows can sometimes differ, but let's check it's readable
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0600 {
+		t.Fatalf("unsafe file permissions: %v", fi.Mode())
+	}
 	if fi.Size() != int64(len(data)) {
 		t.Errorf("size mismatch: expected %d, got %d", len(data), fi.Size())
 	}

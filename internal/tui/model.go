@@ -1,436 +1,417 @@
 package tui
 
 import (
-	"crypto/ed25519"
-	"encoding/json"
-	"fmt"
-	"time"
-
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/libp2p/go-libp2p/core/network"
-
-	"github.com/aegis-p2p/aegis/internal/crypto"
+	"context"
 	"github.com/aegis-p2p/aegis/internal/p2p"
 	"github.com/aegis-p2p/aegis/internal/transfer"
+	tea "github.com/charmbracelet/bubbletea"
+	"strings"
 )
 
-// ── Screens ───────────────────────────────────────────────────────────────────
-
-// Screen identifies the active TUI screen.
 type Screen int
 
 const (
-	ScreenDashboard Screen = iota // Screen 1: PeerID + connect form
-	ScreenVerify                  // Screen 2: Cryptographic fingerprint verification
-	ScreenChat                    // Screen 3: Encrypted chat room
+	ScreenDashboard Screen = iota
+	ScreenChat
 )
 
-// ── Shared Messages ───────────────────────────────────────────────────────────
-
-// NavigateMsg requests a transition to the given screen.
-type NavigateMsg struct{ To Screen }
-
-// blinkTickMsg fires every 500 ms to drive blinking indicator animations.
-// Shared between DashboardModel and VerifyModel.
-type blinkTickMsg struct{}
-
-func blinkCmd() tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(_ time.Time) tea.Msg {
-		return blinkTickMsg{}
-	})
+type initResult struct {
+	Generation uint64
+	Node       *p2p.P2PNode
+	Err        error
 }
-
-// ── P2P Messages ──────────────────────────────────────────────────────────────
-
-type p2pInitSuccessMsg struct {
-	Node   *p2p.P2PNode
-	PeerID string
+type nodeEvent struct {
+	Node  *p2p.P2PNode
+	Event p2p.Event
 }
-
-type p2pInitErrorMsg struct {
-	Err error
+type searchResult struct {
+	Node      *p2p.P2PNode
+	Operation uint64
+	Results   []p2p.SearchResult
+	Err       error
 }
-
-type p2pIncomingStreamMsg struct {
-	Stream network.Stream
+type connectResult struct {
+	Node      *p2p.P2PNode
+	Operation uint64
+	Session   *p2p.Session
+	Err       error
 }
-
-type p2pIncomingHandshakeSuccessMsg struct {
-	Stream    network.Stream
-	Handshake *crypto.HandshakeResult
+type packetMsg struct {
+	Session *p2p.Session
+	Frame   transfer.AegisFrame
+	Err     error
 }
-
-type p2pConnectSuccessMsg struct {
-	Stream    network.Stream
-	Handshake *crypto.HandshakeResult
+type chatEvent struct {
+	Session *p2p.Session
+	Value   any
 }
+type closeRequestMsg struct{ Quit bool }
+type closeConfirmedMsg struct{}
 
-type p2pConnectErrorMsg struct {
-	Err error
-}
-
-type p2pDisconnectMsg struct {
-	Err error
-}
-
-type p2pMessageReceivedMsg struct {
-	Text  string
-	Index uint64
-}
-
-type p2pFileFrameMsg struct {
-	Frame transfer.AegisFrame
-}
-
-// listenForIncomingStreams waits for an incoming /aegis/1.0.0 stream.
-func listenForIncomingStreams(node *p2p.P2PNode) tea.Cmd {
-	if node == nil {
-		return nil
-	}
+func listenNode(n *p2p.P2PNode) tea.Cmd {
 	return func() tea.Msg {
 		select {
-		case s, ok := <-node.IncomingStreamCh:
-			if !ok {
-				return nil
-			}
-			return p2pIncomingStreamMsg{Stream: s}
+		case e := <-n.Events:
+			return nodeEvent{n, e}
+		case <-n.Done():
+			return nil
 		}
 	}
 }
-
-// runResponderHandshakeCmd runs the responder cryptographic handshake in a background command.
-func runResponderHandshakeCmd(node *p2p.P2PNode, stream network.Stream) tea.Cmd {
-	return func() tea.Msg {
-		_ = stream.SetDeadline(time.Now().Add(15 * time.Second))
-		res, err := crypto.RunHandshake(stream, node.Identity, false)
-		if err != nil {
-			_ = stream.Reset()
-			return p2pConnectErrorMsg{Err: err}
-		}
-		_ = stream.SetDeadline(time.Time{}) // Reset stream deadlines for normal operations
-		node.Ratchet = crypto.NewRatchetState(res.SharedRootKey, false)
-		node.RemotePubKey = res.RemotePubKey
-		node.ActiveStream = stream
-		crypto.Array32(&res.SharedRootKey) // Zeroize root key copy from RAM
-		return p2pIncomingHandshakeSuccessMsg{Stream: stream, Handshake: res}
-	}
+func listenMessages(s *p2p.Session) tea.Cmd {
+	return func() tea.Msg { f, err := s.Read(); return packetMsg{s, f, err} }
 }
 
-// listenForMessages reads incoming frames from the active stream, verifies signatures, and decrypts payloads.
-func listenForMessages(node *p2p.P2PNode) tea.Cmd {
-	return func() tea.Msg {
-		if node == nil || node.ActiveStream == nil || node.Ratchet == nil || node.RemotePubKey == nil {
-			LogDebug("listenForMessages returning empty p2pDisconnectMsg: node=%v, activeStream=%v, ratchet=%v, remotePubKey=%v", node != nil, node != nil && node.ActiveStream != nil, node != nil && node.Ratchet != nil, node != nil && node.RemotePubKey != nil)
-			return p2pDisconnectMsg{}
-		}
-
-		// 1. Read the length-prefixed frame
-		payload, err := p2p.ReadFrame(node.ActiveStream)
-		if err != nil {
-			LogDebug("ReadFrame failed: %v", err)
-			return p2pDisconnectMsg{Err: err}
-		}
-
-		// Taşkın koruması hız sınırı kontrolü
-		if node.Limiter != nil && !node.Limiter.Allow() {
-			return p2pDisconnectMsg{Err: fmt.Errorf("security alert: packet flood detected from peer")}
-		}
-
-		// 2. Unpack signature and ciphertext
-		if len(payload) < 64 {
-			return p2pDisconnectMsg{Err: fmt.Errorf("received packet too short: %d bytes", len(payload))}
-		}
-		sig := payload[:64]
-		ciphertext := payload[64:]
-
-		// 3. Verify remote Ed25519 signature
-		if !ed25519.Verify(node.RemotePubKey, ciphertext, sig) {
-			return p2pDisconnectMsg{Err: fmt.Errorf("cryptographic signature verification failed (MitM alert)")}
-		}
-
-		// 4. Generate symmetric AAD
-		peerA := node.Host.ID().String()
-		peerB := node.ActiveStream.Conn().RemotePeer().String()
-		var aad []byte
-		if peerA < peerB {
-			aad = []byte(peerA + ":" + peerB)
-		} else {
-			aad = []byte(peerB + ":" + peerA)
-		}
-
-		// 5. Decrypt using Double Ratchet
-		plaintext, err := node.Ratchet.DecryptMessage(ciphertext, aad)
-		if err != nil {
-			LogDebug("DecryptMessage failed: %v", err)
-			return p2pDisconnectMsg{Err: fmt.Errorf("failed to decrypt message: %w", err)}
-		}
-		defer crypto.Bytes(plaintext)
-
-		// 6. Unmarshal AegisFrame JSON
-		var frame transfer.AegisFrame
-		if err := json.Unmarshal(plaintext, &frame); err != nil {
-			return p2pDisconnectMsg{Err: fmt.Errorf("failed to parse decrypted frame JSON: %w", err)}
-		}
-
-		if frame.Type == transfer.TypeMsg {
-			// TUI dondurma taşkın koruması kontrolü
-			if len(frame.MsgText) > 8*1024 {
-				return p2pDisconnectMsg{Err: fmt.Errorf("security alert: message text exceeds secure limit of 8 KB")}
-			}
-			return p2pMessageReceivedMsg{
-				Text:  frame.MsgText,
-				Index: uint64(frame.Index),
-			}
-		}
-		return p2pFileFrameMsg{Frame: frame}
-	}
-}
-
-// ── Root Model ────────────────────────────────────────────────────────────────
-
-// Model is the root Bubbletea model. It owns all sub-screen models and routes
-// messages between them based on the currently active screen.
+// Model owns UI lifetime. Async results carry their node, operation or session
+// identity, so work from a previous session can never change a new one.
 type Model struct {
-	screen           Screen
-	width            int
-	height           int
-	dashboard        DashboardModel
-	verify           VerifyModel
-	chat             ChatModel
-	p2pNode          *p2p.P2PNode
-	customRelay      string
-	defaultDownloads string
-	debug            bool
+	screen                 Screen
+	width, height          int
+	dashboard              DashboardModel
+	chat                   ChatModel
+	node                   *p2p.P2PNode
+	session                *p2p.Session
+	customRelay, downloads string
+	generation, operation  uint64
+	operationCancel        context.CancelFunc
+	closing                bool
+	quitAfter              bool
+	lost                   bool
 }
 
-// NewModel constructs the root model with all sub-screens initialised.
-func NewModel(customRelay string, defaultDownloads string, debug bool) Model {
-	return Model{
-		screen:           ScreenDashboard,
-		dashboard:        NewDashboard(customRelay),
-		verify:           NewVerify(),
-		chat:             NewChat(defaultDownloads),
-		customRelay:      customRelay,
-		defaultDownloads: defaultDownloads,
-		debug:            debug,
-	}
+func NewModel(relay, downloads string, debug bool) Model {
+	SetDebug(debug)
+	return Model{dashboard: NewDashboard(relay), customRelay: relay, downloads: downloads}
 }
-
-// Init returns the startup commands for the initial screen (dashboard).
-func (m Model) Init() tea.Cmd {
-	return m.dashboard.Init()
+func (m Model) Init() tea.Cmd { return m.dashboard.Init() }
+func (m *Model) initialize(name string) tea.Cmd {
+	m.generation++
+	gen := m.generation
+	relay := m.customRelay
+	name = strings.TrimSpace(name)
+	m.dashboard.name = name
+	m.dashboard.phase = phaseInitializing
+	m.dashboard.errorText = ""
+	return func() tea.Msg { n, err := p2p.NewP2PNode(name, relay); return initResult{gen, n, err} }
 }
-
-// Update processes all incoming messages and routes them to the active screen.
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-
-	// ── Terminal resize ───────────────────────────────────────────────────────
-	case tea.WindowSizeMsg:
-		m.width, m.height = msg.Width, msg.Height
-		var cmds []tea.Cmd
-		var cmd tea.Cmd
-		m.dashboard, cmd = m.dashboard.UpdateSize(msg.Width, msg.Height)
-		cmds = append(cmds, cmd)
-		m.verify, cmd = m.verify.UpdateSize(msg.Width, msg.Height)
-		cmds = append(cmds, cmd)
-		m.chat, cmd = m.chat.UpdateSize(msg.Width, msg.Height)
-		cmds = append(cmds, cmd)
-		return m, tea.Batch(cmds...)
-
-	// ── Global quit ───────────────────────────────────────────────────────────
-	case tea.KeyMsg:
-		if msg.Type == tea.KeyCtrlC {
-			if m.p2pNode != nil {
-				_ = m.p2pNode.Close()
-			}
-			return m, tea.Quit
-		}
-
-	// ── P2P Events ────────────────────────────────────────────────────────────
-	case p2pInitSuccessMsg:
-		m.p2pNode = msg.Node
-		m.dashboard.p2pNode = msg.Node
-		m.dashboard.peerID = msg.PeerID
-		m.dashboard.phase = phaseIdle
-		m.dashboard.input.SetValue("")
-		m.dashboard.input.Placeholder = "enter remote Peer ID or Multiaddr..."
-		m.dashboard.input.EchoMode = textinput.EchoNormal
-		return m, listenForIncomingStreams(m.p2pNode)
-
-	case p2pInitErrorMsg:
-		m.dashboard.passphraseErr = msg.Err.Error()
-		m.dashboard.phase = phasePassphrase
-		return m, nil
-
-	case p2pIncomingStreamMsg:
-		m.dashboard.phase = phaseScanning
-		m.dashboard.scanStep = 21
-		return m, tea.Batch(
-			scanStepCmd(),
-			runResponderHandshakeCmd(m.p2pNode, msg.Stream),
-		)
-
-	case p2pIncomingHandshakeSuccessMsg:
-		m.p2pNode.RemotePubKey = msg.Handshake.RemotePubKey
-		m.screen = ScreenVerify
-		m.verify = NewVerify()
-		m.verify.p2pNode = m.p2pNode
-		m.verify.localFP = crypto.Fingerprint(msg.Handshake.LocalIdentity.PublicKey)
-		m.verify.remoteFP = crypto.Fingerprint(msg.Handshake.RemotePubKey)
-		m.verify.sas = crypto.SAS(msg.Handshake.LocalIdentity.PublicKey, msg.Handshake.RemotePubKey)
-		if m.width > 0 {
-			m.verify, _ = m.verify.UpdateSize(m.width, m.height)
-		}
-		return m, m.verify.Init()
-
-	case p2pConnectSuccessMsg:
-		m.p2pNode.RemotePubKey = msg.Handshake.RemotePubKey
-		m.screen = ScreenVerify
-		m.verify = NewVerify()
-		m.verify.p2pNode = m.p2pNode
-		m.verify.localFP = crypto.Fingerprint(msg.Handshake.LocalIdentity.PublicKey)
-		m.verify.remoteFP = crypto.Fingerprint(msg.Handshake.RemotePubKey)
-		m.verify.sas = crypto.SAS(msg.Handshake.LocalIdentity.PublicKey, msg.Handshake.RemotePubKey)
-		if m.width > 0 {
-			m.verify, _ = m.verify.UpdateSize(m.width, m.height)
-		}
-		return m, m.verify.Init()
-
-	case p2pConnectErrorMsg:
-		m.dashboard.connectErr = msg.Err.Error()
-		m.dashboard.phase = phaseIdle
-		return m, listenForIncomingStreams(m.p2pNode)
-
-	case p2pDisconnectMsg:
-		LogDebug("p2pDisconnectMsg received in Model.Update: err=%v", msg.Err)
-		if m.p2pNode != nil {
-			if m.p2pNode.ActiveStream != nil {
-				_ = m.p2pNode.ActiveStream.Close()
-				m.p2pNode.ActiveStream = nil
-			}
-			if m.p2pNode.Ratchet != nil {
-				m.p2pNode.Ratchet.Destroy()
-				m.p2pNode.Ratchet = nil
-			}
-			m.p2pNode.RemotePubKey = nil
-		}
-		m.chat.Destroy()
-		m.screen = ScreenDashboard
-		m.dashboard = NewDashboard(m.customRelay)
-		m.dashboard.p2pNode = m.p2pNode
-		if m.p2pNode != nil {
-			m.dashboard.peerID = m.p2pNode.Host.ID().String()
-			m.dashboard.phase = phaseIdle
-			m.dashboard.input.SetValue("")
-			m.dashboard.input.Placeholder = "enter remote Peer ID or Multiaddr..."
-			m.dashboard.input.EchoMode = textinput.EchoNormal
-		}
-		if msg.Err != nil {
-			m.dashboard.connectErr = fmt.Sprintf("disconnected: %v", msg.Err)
-		} else {
-			m.dashboard.connectErr = "session disconnected"
-		}
-		if m.width > 0 {
-			m.dashboard, _ = m.dashboard.UpdateSize(m.width, m.height)
-		}
-		return m, tea.Batch(m.dashboard.Init(), listenForIncomingStreams(m.p2pNode))
-
-	// ── Screen navigation ─────────────────────────────────────────────────────
-	case NavigateMsg:
-		m.screen = msg.To
-		switch msg.To {
-		case ScreenDashboard:
-			if m.p2pNode != nil {
-				if m.p2pNode.ActiveStream != nil {
-					_ = m.p2pNode.ActiveStream.Close()
-					m.p2pNode.ActiveStream = nil
-				}
-				if m.p2pNode.Ratchet != nil {
-					m.p2pNode.Ratchet.Destroy()
-					m.p2pNode.Ratchet = nil
-				}
-				m.p2pNode.RemotePubKey = nil
-			}
-			m.chat.Destroy()
-			m.dashboard = NewDashboard(m.customRelay)
-			m.dashboard.p2pNode = m.p2pNode
-			if m.p2pNode != nil {
-				m.dashboard.peerID = m.p2pNode.Host.ID().String()
-				m.dashboard.phase = phaseIdle
-				m.dashboard.input.SetValue("")
-				m.dashboard.input.Placeholder = "enter remote Peer ID or Multiaddr..."
-				m.dashboard.input.EchoMode = textinput.EchoNormal
-			}
-			if m.width > 0 {
-				m.dashboard, _ = m.dashboard.UpdateSize(m.width, m.height)
-			}
-			var cmd tea.Cmd
-			if m.p2pNode != nil {
-				cmd = listenForIncomingStreams(m.p2pNode)
-			}
-			return m, tea.Batch(m.dashboard.Init(), cmd)
-
-		case ScreenVerify:
-			m.verify = NewVerify()
-			m.verify.p2pNode = m.p2pNode
-			if m.p2pNode != nil && m.p2pNode.ActiveStream != nil {
-				m.verify.remoteFP = m.p2pNode.ActiveStream.Conn().RemotePeer().String()
-			}
-			if m.width > 0 {
-				m.verify, _ = m.verify.UpdateSize(m.width, m.height)
-			}
-			return m, m.verify.Init()
-
-		case ScreenChat:
-			m.chat = NewChat(m.defaultDownloads)
-			m.chat.p2pNode = m.p2pNode
-			if m.p2pNode != nil && m.p2pNode.ActiveStream != nil {
-				m.chat.peerHandle = m.p2pNode.ActiveStream.Conn().RemotePeer().String()
-			}
-			if m.width > 0 {
-				m.chat, _ = m.chat.UpdateSize(m.width, m.height)
-			}
-			return m, tea.Batch(m.chat.Init(), listenForMessages(m.p2pNode))
-		}
-		return m, nil
+func (m *Model) cancelOperation() {
+	if m.operationCancel != nil {
+		m.operationCancel()
+		m.operationCancel = nil
 	}
-
-	// ── Delegate to the active screen ─────────────────────────────────────────
-	var cmd tea.Cmd
-	switch m.screen {
-	case ScreenDashboard:
-		m.dashboard, cmd = m.dashboard.Update(msg)
-	case ScreenVerify:
-		m.verify, cmd = m.verify.Update(msg)
-	case ScreenChat:
-		m.chat, cmd = m.chat.Update(msg)
-	}
-	return m, cmd
+	m.operation++
 }
-
-// View renders the currently active screen.
-func (m Model) View() string {
-	if m.width == 0 {
-		return PrimaryText.Render("  initializing aegis...")
-	}
-	switch m.screen {
-	case ScreenDashboard:
-		return m.dashboard.View()
-	case ScreenVerify:
-		return m.verify.View()
-	case ScreenChat:
-		return m.chat.View()
-	}
-	return ""
-}
-
-// Close gracefully terminates the node and zeroizes all active key materials and buffers.
-func (m *Model) Close() {
-	if m.p2pNode != nil {
-		_ = m.p2pNode.Close()
+func (m *Model) finishClose() (tea.Model, tea.Cmd) {
+	m.cancelOperation()
+	if m.node != nil {
+		_ = m.node.Close()
 	}
 	m.chat.Destroy()
+	m.node = nil
+	m.session = nil
+	m.closing = false
+	m.lost = false
+	if m.quitAfter {
+		return m, tea.Quit
+	}
+	name := m.dashboard.name
+	visible := m.dashboard.discoverable
+	m.screen = ScreenDashboard
+	m.dashboard = NewDashboard(m.customRelay)
+	name = strings.TrimSpace(name)
+	m.dashboard.name = name
+	m.dashboard.discoverable = visible
+	m.dashboard, _ = m.dashboard.UpdateSize(m.width, m.height)
+	return m, m.initialize(name)
 }
-
+func (m *Model) requestClose(quit, lost bool) (tea.Model, tea.Cmd) {
+	m.quitAfter = quit
+	m.lost = lost
+	if m.screen == ScreenChat && m.chat.engine.Snapshot().Unsaved {
+		m.closing = true
+		m.chat.closePrompt = true
+		m.chat.closeLost = lost
+		return m, nil
+	}
+	return m, m.closeCmd()
+}
+func (m *Model) closeCmd() tea.Cmd { return func() tea.Msg { return closeConfirmedMsg{} } }
+func (m *Model) startChat(s *p2p.Session) tea.Cmd {
+	m.cancelOperation()
+	m.session = s
+	m.screen = ScreenChat
+	m.dashboard.incoming = nil
+	m.chat = NewChat(m.downloads, s)
+	m.chat, _ = m.chat.UpdateSize(m.width, m.height)
+	return tea.Batch(m.chat.Init(), listenMessages(s))
+}
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch v := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = v.Width, v.Height
+		m.dashboard, _ = m.dashboard.UpdateSize(v.Width, v.Height)
+		if m.chat.engine != nil {
+			m.chat, _ = m.chat.UpdateSize(v.Width, v.Height)
+		}
+		return m, nil
+	case initResult:
+		if v.Generation != m.generation {
+			if v.Node != nil {
+				_ = v.Node.Close()
+			}
+			return m, nil
+		}
+		if v.Err != nil {
+			m.dashboard.phase = phaseName
+			m.dashboard.errorText = v.Err.Error()
+			return m, nil
+		}
+		m.node = v.Node
+		m.dashboard.node = v.Node
+		m.node.SetDiscoverable(m.dashboard.discoverable)
+		m.dashboard.ready()
+		return m, listenNode(m.node)
+	case nodeEvent:
+		if v.Node != m.node {
+			if v.Event.Session != nil {
+				v.Event.Session.Close()
+			}
+			if v.Event.Request != nil {
+				v.Event.Request.Decide(false)
+			}
+			return m, nil
+		}
+		next := listenNode(m.node)
+		if v.Event.Request != nil {
+			m.cancelOperation()
+			m.dashboard.incoming = v.Event.Request
+			m.dashboard.phase = phaseRequest
+			m.dashboard.results = nil
+			return m, next
+		}
+		if v.Event.Session != nil {
+			return m, tea.Batch(next, m.startChat(v.Event.Session))
+		}
+		if v.Event.Err != nil && m.screen == ScreenDashboard {
+			m.dashboard.ready()
+			m.dashboard.errorText = v.Event.Err.Error()
+		}
+		return m, next
+	case searchResult:
+		if v.Node != m.node || v.Operation != m.operation {
+			return m, nil
+		}
+		m.dashboard.phase = phaseIdle
+		m.dashboard.results = v.Results
+		m.dashboard.selected = 0
+		m.dashboard.errorText = ""
+		if v.Err != nil {
+			LogDebug("search failed")
+			m.dashboard.errorText = v.Err.Error()
+		} else if len(v.Results) == 0 {
+			m.dashboard.status = "No live matching person found. Try again after discovery is ready."
+		} else {
+			m.dashboard.status = "Select a person and press Enter to send a request."
+		}
+		return m, nil
+	case connectResult:
+		if v.Node != m.node || v.Operation != m.operation {
+			if v.Session != nil {
+				v.Session.Close()
+			}
+			return m, nil
+		}
+		if v.Err != nil {
+			m.dashboard.ready()
+			m.dashboard.errorText = v.Err.Error()
+			return m, nil
+		}
+		return m, m.startChat(v.Session)
+	case packetMsg:
+		if v.Session != m.session {
+			cryptoFrameClear(v.Frame)
+			return m, nil
+		}
+		if v.Err != nil {
+			LogDebug("session closed")
+			m.chat.addSystem("Connection ended: " + v.Err.Error())
+			m.session = nil
+			go v.Session.Close()
+			return m.requestClose(false, true)
+		}
+		var cmd tea.Cmd
+		m.chat, cmd = m.chat.Update(v)
+		return m, tea.Batch(cmd, listenMessages(v.Session))
+	case chatEvent:
+		if v.Session != m.chat.session || m.screen != ScreenChat {
+			disposeChatEvent(v.Value)
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.chat, cmd = m.chat.Update(v.Value)
+		return m, cmd
+	case closeRequestMsg:
+		return m.requestClose(v.Quit, false)
+	case closeConfirmedMsg:
+		return m.finishClose()
+	case tea.KeyMsg:
+		if v.Type == tea.KeyCtrlC {
+			return m.requestClose(true, false)
+		}
+		if m.screen == ScreenDashboard {
+			return m.updateDashboard(v)
+		}
+		if m.closing && v.String() == "esc" && !m.lost {
+			m.closing = false
+			m.chat.closePrompt = false
+			m.chat.finishAfterSave = false
+			return m, nil
+		}
+	}
+	if m.screen == ScreenChat {
+		var cmd tea.Cmd
+		m.chat, cmd = m.chat.Update(msg)
+		return m, cmd
+	}
+	return m, nil
+}
+func (m Model) updateDashboard(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	d := &m.dashboard
+	switch d.phase {
+	case phaseName:
+		if key.String() == "esc" {
+			m.quitAfter = true
+			return m, tea.Quit
+		}
+		if key.String() == "enter" {
+			name := d.input.Value()
+			if _, err := p2p.NormalizeName(name); err != nil {
+				d.errorText = err.Error()
+				return m, nil
+			}
+			return m, m.initialize(name)
+		}
+	case phaseInitializing:
+		return m, nil
+	case phaseRequest:
+		if key.String() == "y" || key.String() == "Y" {
+			d.incoming.Decide(true)
+			d.phase = phaseConnecting
+			return m, nil
+		}
+		if key.String() == "n" || key.String() == "N" || key.String() == "esc" {
+			d.incoming.Decide(false)
+			d.ready()
+			return m, nil
+		}
+		return m, nil
+	case phaseSearching, phaseConnecting:
+		if key.String() == "esc" {
+			m.cancelOperation()
+			if d.phase == phaseConnecting {
+				if d.incoming != nil {
+					d.incoming.Decide(false)
+				}
+				m.quitAfter = false
+				return m, m.closeCmd()
+			}
+			d.ready()
+			d.status = "Cancelled."
+		}
+		return m, nil
+	case phaseIdle:
+		switch key.String() {
+		case "f2":
+			d.discoverable = !d.discoverable
+			m.node.SetDiscoverable(d.discoverable)
+			return m, nil
+		case "f3":
+			d.advanced = !d.advanced
+			d.results = nil
+			d.input.SetValue("")
+			if d.advanced {
+				d.input.CharLimit = 2048
+				d.input.Placeholder = "Peer ID or full multiaddress..."
+			} else {
+				d.input.CharLimit = 32
+				d.input.Placeholder = "search a temporary name..."
+			}
+			return m, nil
+		case "up":
+			d.selected = max(0, d.selected-1)
+			return m, nil
+		case "down":
+			d.selected = min(max(0, len(d.results)-1), d.selected+1)
+			return m, nil
+		case "esc":
+			if len(d.results) > 0 {
+				d.results = nil
+				d.status = ""
+				return m, nil
+			}
+			m.quitAfter = true
+			return m, m.closeCmd()
+		case "enter":
+			m.cancelOperation()
+			op := m.operation
+			n := m.node
+			ctx, cancel := context.WithCancel(context.Background())
+			m.operationCancel = cancel
+			if d.advanced || len(d.results) > 0 {
+				target := d.input.Value()
+				if !d.advanced {
+					result := d.results[d.selected]
+					if !result.Profile.Available {
+						d.errorText = "This person is busy."
+						cancel()
+						return m, nil
+					}
+					target = result.Profile.PeerID
+				}
+				d.phase = phaseConnecting
+				d.errorText = ""
+				return m, func() tea.Msg { s, err := n.Connect(ctx, target); return connectResult{n, op, s, err} }
+			}
+			name := d.input.Value()
+			if _, err := p2p.NormalizeName(name); err != nil {
+				cancel()
+				d.errorText = err.Error()
+				return m, nil
+			}
+			d.phase = phaseSearching
+			d.errorText = ""
+			d.status = ""
+			return m, func() tea.Msg { results, err := n.Search(ctx, name); return searchResult{n, op, results, err} }
+		}
+	}
+	if len(d.results) > 0 {
+		d.results = nil
+		d.status = ""
+	}
+	var cmd tea.Cmd
+	d.input, cmd = d.input.Update(key)
+	return m, cmd
+}
+func (m Model) View() string {
+	if m.width == 0 {
+		return "initializing aegis..."
+	}
+	if m.screen == ScreenChat {
+		return m.chat.View()
+	}
+	return m.dashboard.View()
+}
+func (m *Model) Close() {
+	m.cancelOperation()
+	if m.node != nil {
+		_ = m.node.Close()
+	}
+	if m.chat.engine != nil {
+		m.chat.Destroy()
+	}
+}
+func cryptoFrameClear(f transfer.AegisFrame) {
+	for i := range f.Data {
+		f.Data[i] = 0
+	}
+}

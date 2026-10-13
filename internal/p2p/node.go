@@ -2,7 +2,6 @@ package p2p
 
 import (
 	"context"
-	"crypto/ed25519"
 	"fmt"
 	"net"
 	"strings"
@@ -57,157 +56,115 @@ func (rl *RateLimiter) Allow() bool {
 	return false
 }
 
-// P2PNode coordinates libp2p host, discovery, active stream, identities, and ratchets.
+// P2PNode owns one ephemeral identity and at most one pending/active session.
 type P2PNode struct {
-	Host             host.Host
-	Discovery        *DiscoveryManager
-	ActiveStream     network.Stream
-	Identity         *crypto.Identity
-	Ratchet          *crypto.RatchetState
-	RemotePubKey     ed25519.PublicKey
-	ctx              context.Context
-	cancel           context.CancelFunc
-	customRelay      string
-	IncomingStreamCh chan network.Stream
-	Limiter          *RateLimiter
+	Host            host.Host
+	Discovery       *DiscoveryManager
+	Identity        *crypto.Identity
+	Events          chan Event
+	ctx             context.Context
+	cancel          context.CancelFunc
+	customRelay     string
+	mu              sync.Mutex
+	name            string
+	discoverable    bool
+	busy            bool
+	closed          bool
+	active          *Session
+	pending         network.Stream
+	advertiseCancel context.CancelFunc
+	profileLimiter  *RateLimiter
+	requestLimiter  *RateLimiter
+	closeOnce       sync.Once
 }
 
-// NewP2PNode initializes a new deterministic libp2p node and generates a fresh ephemeral identity.
-func NewP2PNode(passphrase string, customRelay string) (*P2PNode, error) {
+func NewP2PNode(name, customRelay string) (*P2PNode, error) {
+	if _, err := NormalizeName(name); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-
-	h, err := NewHost(ctx, passphrase, customRelay)
+	h, err := NewHost(ctx, customRelay)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-
 	dm, err := NewDiscoveryManager(ctx, h, customRelay)
 	if err != nil {
-		h.Close()
+		_ = h.Close()
 		cancel()
 		return nil, err
 	}
-
-	ident, err := crypto.NewIdentity()
+	n, err := newNode(ctx, cancel, h, dm, name, customRelay)
 	if err != nil {
-		dm.Close()
-		h.Close()
+		_ = dm.Close()
+		_ = h.Close()
 		cancel()
 		return nil, err
 	}
-
-	node := &P2PNode{
-		Host:             h,
-		Discovery:        dm,
-		Identity:         ident,
-		ctx:              ctx,
-		cancel:           cancel,
-		customRelay:      customRelay,
-		IncomingStreamCh: make(chan network.Stream, 1),
-		Limiter:          NewRateLimiter(150, 200),
-	}
-
-	// Register protocol handler for /aegis/1.0.0
-	h.SetStreamHandler(ProtocolID, func(s network.Stream) {
-		select {
-		case node.IncomingStreamCh <- s:
-			// Stream successfully passed to TUI dispatcher
-		default:
-			// If already in a session or busy, reject incoming stream.
-			_ = s.Reset()
-		}
-	})
-
-	// Start rendezvous-based DHT advertising so this node is discoverable
-	// by other Aegis peers on different networks via FindProviders().
-	dm.StartAdvertising(ctx)
-
-	return node, nil
+	n.SetDiscoverable(true)
+	return n, nil
 }
 
-// Connect attempts to find a peer, connect, open a stream, and run the initiator handshake.
-// It supports both a raw PeerID string and a full Multiaddress string containing a PeerID.
-func (n *P2PNode) Connect(ctx context.Context, peerIDOrMultiaddr string) (network.Stream, *crypto.HandshakeResult, error) {
-	var targetID peer.ID
-	var addrInfo peer.AddrInfo
-	var err error
+func newNode(ctx context.Context, cancel context.CancelFunc, h host.Host, dm *DiscoveryManager, name, relay string) (*P2PNode, error) {
+	ident, err := crypto.NewIdentity()
+	if err != nil {
+		return nil, err
+	}
+	name = strings.TrimSpace(name)
+	n := &P2PNode{Host: h, Discovery: dm, Identity: ident, ctx: ctx, cancel: cancel, name: name, customRelay: relay, Events: make(chan Event, 8), profileLimiter: NewRateLimiter(5, 10), requestLimiter: NewRateLimiter(1, 5)}
+	h.SetStreamHandler(ProfileProtocol, n.handleProfile)
+	h.SetStreamHandler(ProtocolID, n.handleRequest)
+	return n, nil
+}
 
-	// Try to parse as Multiaddress first
-	if ma, errAddr := multiaddr.NewMultiaddr(peerIDOrMultiaddr); errAddr == nil {
-		info, errInfo := peer.AddrInfoFromP2pAddr(ma)
-		if errInfo == nil {
-			targetID = info.ID
-			addrInfo = *info
-			// Add the address to Peerstore so libp2p knows how to reach it
-			n.Host.Peerstore().AddAddrs(targetID, addrInfo.Addrs, time.Hour)
-		} else {
-			return nil, nil, fmt.Errorf("invalid multiaddress format: %w", errInfo)
+func (n *P2PNode) Done() <-chan struct{} { return n.ctx.Done() }
+
+func (n *P2PNode) dial(ctx context.Context, target string) (network.Stream, error) {
+	var pi peer.AddrInfo
+	if ma, err := multiaddr.NewMultiaddr(target); err == nil {
+		info, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil {
+			return nil, err
 		}
+		pi = *info
 	} else {
-		// Fallback to decoding as raw PeerID
-		targetID, err = peer.Decode(peerIDOrMultiaddr)
+		id, err := peer.Decode(target)
 		if err != nil {
-			return nil, nil, fmt.Errorf("invalid PeerID or Multiaddr format: %w", err)
+			return nil, fmt.Errorf("invalid Peer ID or address")
 		}
-
-		// Find Peer multiaddrs via DHT/Peerstore
-		addrInfo, err = n.Discovery.FindPeer(ctx, targetID)
-		if err != nil {
-			return nil, nil, err
+		if id == n.Host.ID() {
+			return nil, fmt.Errorf("cannot connect to yourself")
+		}
+		pi = peer.AddrInfo{ID: id, Addrs: n.Host.Peerstore().Addrs(id)}
+		if len(pi.Addrs) == 0 && n.Discovery != nil {
+			pi, err = n.Discovery.FindPeer(ctx, id)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
-
-	// 2. Connect to the peer
-	err = n.Host.Connect(ctx, addrInfo)
+	if pi.ID == n.Host.ID() {
+		return nil, fmt.Errorf("cannot connect to yourself")
+	}
+	if err := n.Host.Connect(ctx, pi); err != nil {
+		n.Host.Peerstore().ClearAddrs(pi.ID)
+		if n.Discovery != nil {
+			if fresh, e := n.Discovery.FindPeer(ctx, pi.ID); e == nil {
+				pi = fresh
+			}
+		}
+		if e := n.Host.Connect(ctx, pi); e != nil {
+			pi.Addrs = n.buildRelayCircuitAddrs(pi.ID)
+			if e = n.Host.Connect(ctx, pi); e != nil {
+				return nil, fmt.Errorf("peer unreachable (direct and relay): %w", e)
+			}
+		}
+	}
+	s, err := n.Host.NewStream(network.WithAllowLimitedConn(ctx, "aegis session"), pi.ID, ProtocolID)
 	if err != nil {
-		// Connection failed. It could be due to outdated cached addresses in Peerstore.
-		// Clear peerstore cache for this target and attempt a fresh DHT lookup.
-		n.Host.Peerstore().ClearAddrs(targetID)
-
-		freshAddrInfo, freshErr := n.Discovery.FindPeer(ctx, targetID)
-		if freshErr == nil && len(freshAddrInfo.Addrs) > 0 {
-			addrInfo = freshAddrInfo
-			err = n.Host.Connect(ctx, addrInfo)
-		}
+		return nil, fmt.Errorf("peer does not support Aegis v2: %w", err)
 	}
-
-	// 3. If direct connection (cached or fresh) still failed, attempt relay fallback
-	if err != nil {
-		relayAddrs := n.buildRelayCircuitAddrs(targetID)
-		if len(relayAddrs) == 0 {
-			return nil, nil, fmt.Errorf("failed to connect to peer: %w\n  hint: relay not ready — wait for ADDRESS field to show a /p2p-circuit address", err)
-		}
-		relayAddrInfo := peer.AddrInfo{
-			ID:    targetID,
-			Addrs: relayAddrs,
-		}
-		n.Host.Peerstore().AddAddrs(targetID, relayAddrs, time.Hour)
-		if err2 := n.Host.Connect(ctx, relayAddrInfo); err2 != nil {
-			return nil, nil, fmt.Errorf("failed to connect to peer (direct and relay): %w", err2)
-		}
-	}
-
-	// 3. Open stream
-	stream, err := n.Host.NewStream(ctx, targetID, ProtocolID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open protocol stream: %w", err)
-	}
-
-	// 4. Run initiator handshake (X25519 exchange + Ed25519 auth) with a 15-second deadline
-	_ = stream.SetDeadline(time.Now().Add(15 * time.Second))
-	res, err := crypto.RunHandshake(stream, n.Identity, true)
-	if err != nil {
-		_ = stream.Reset()
-		return nil, nil, fmt.Errorf("cryptographic handshake failed: %w", err)
-	}
-	_ = stream.SetDeadline(time.Time{}) // Reset stream deadlines for normal operations
-
-	n.Ratchet = crypto.NewRatchetState(res.SharedRootKey, true)
-	n.RemotePubKey = res.RemotePubKey
-	n.ActiveStream = stream
-	crypto.Array32(&res.SharedRootKey) // Zeroize root key copy from RAM
-	return stream, res, nil
+	return s, nil
 }
 
 // buildRelayCircuitAddrs constructs /p2p-circuit multiaddrs for all known relay nodes,
@@ -226,7 +183,7 @@ func (n *P2PNode) buildRelayCircuitAddrs(targetID peer.ID) []multiaddr.Multiaddr
 	var addrs []multiaddr.Multiaddr
 	seen := make(map[string]bool)
 
-	for _, relayInfo := range GetRelayAddrInfos() {
+	for _, relayInfo := range relayAddrInfos(n.customRelay) {
 		relayPart, err := multiaddr.NewMultiaddr("/p2p/" + relayInfo.ID.String())
 		if err != nil {
 			continue
@@ -260,22 +217,6 @@ func (n *P2PNode) HasRelayAddress() bool {
 		}
 	}
 	return false
-}
-
-// GetConnectionType checks if the active stream is relayed or direct.
-func (n *P2PNode) GetConnectionType() string {
-	if n.ActiveStream == nil {
-		return "Unknown"
-	}
-	conn := n.ActiveStream.Conn()
-	if conn == nil {
-		return "Unknown"
-	}
-	remoteAddr := conn.RemoteMultiaddr().String()
-	if strings.Contains(remoteAddr, "/p2p-circuit") {
-		return "Relay"
-	}
-	return "Direct"
 }
 
 // isUsableIP returns true if the IP string is a routable LAN or public address.
@@ -368,19 +309,29 @@ func (n *P2PNode) GetAddresses() []string {
 	return addrs
 }
 
-// Close gracefully terminates the node and zeroizes all active key materials.
+// Close cancels pending operations before destroying owned secrets.
 func (n *P2PNode) Close() error {
-	n.cancel()
-	if n.ActiveStream != nil {
-		_ = n.ActiveStream.Close()
-	}
-	if n.Ratchet != nil {
-		n.Ratchet.Destroy()
-	}
-	if n.Identity != nil {
+	n.closeOnce.Do(func() {
+		n.mu.Lock()
+		n.closed = true
+		n.cancel()
+		pending := n.pending
+		active := n.active
+		n.mu.Unlock()
+		if pending != nil {
+			_ = pending.Reset()
+		}
+		if active != nil {
+			active.Close()
+		}
+		if n.Discovery != nil {
+			_ = n.Discovery.Close()
+		}
+		_ = n.Host.Close()
+		// Handshakes use their own identity copy; closing cannot race with signing.
+		n.mu.Lock()
 		n.Identity.Destroy()
-	}
-	_ = n.Discovery.Close()
-	_ = n.Host.Close()
+		n.mu.Unlock()
+	})
 	return nil
 }

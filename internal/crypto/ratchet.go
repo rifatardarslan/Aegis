@@ -10,7 +10,7 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// RatchetState holds the keys for the symmetric double ratchet session.
+// RatchetState holds the keys for the symmetric key-chain session.
 type RatchetState struct {
 	SendChainKey [32]byte
 	RecvChainKey [32]byte
@@ -30,7 +30,8 @@ func NewRatchetState(sharedRootKey [32]byte, isInitiator bool) *RatchetState {
 	defer Bytes(keys[:])
 
 	var sendKey, recvKey [32]byte
-	// NOTE: Do NOT defer-zero sendKey/recvKey; they are copied by value into the struct.
+	defer Array32(&sendKey)
+	defer Array32(&recvKey)
 
 	if isInitiator {
 		copy(sendKey[:], keys[:32])
@@ -60,8 +61,8 @@ func kdfStep(chainKey [32]byte) ([32]byte, [32]byte, error) {
 	defer Bytes(out[:])
 
 	var nextChainKey, msgKey [32]byte
-	// NOTE: Do NOT defer-zero nextChainKey/msgKey here; they are returned by value.
-	// Callers are responsible for zeroizing their copies after use.
+	defer Array32(&nextChainKey)
+	defer Array32(&msgKey)
 
 	copy(nextChainKey[:], out[:32])
 	copy(msgKey[:], out[32:])
@@ -81,7 +82,7 @@ func (r *RatchetState) EncryptMessage(plaintext []byte, aad []byte) ([]byte, err
 		return nil, fmt.Errorf("ratchet KDF advance failed: %w", err)
 	}
 	defer Array32(&msgKey)
-	r.SendChainKey = nextChain
+	defer Array32(&nextChain)
 
 	nonce := makeNonce(r.SendMsgNum)
 	ciphertext, err := Seal(msgKey, nonce, plaintext, aad)
@@ -94,6 +95,7 @@ func (r *RatchetState) EncryptMessage(plaintext []byte, aad []byte) ([]byte, err
 	binary.BigEndian.PutUint64(payload[:8], r.SendMsgNum)
 	copy(payload[8:], ciphertext)
 
+	r.SendChainKey = nextChain
 	r.SendMsgNum++
 	return payload, nil
 }
@@ -116,7 +118,7 @@ func (r *RatchetState) DecryptMessage(payload []byte, aad []byte) ([]byte, error
 		return nil, fmt.Errorf("ratchet KDF advance failed: %w", err)
 	}
 	defer Array32(&msgKey)
-	r.RecvChainKey = nextChain
+	defer Array32(&nextChain)
 
 	nonce := makeNonce(msgNum)
 	plaintext, err := Open(msgKey, nonce, ciphertext, aad)
@@ -124,6 +126,7 @@ func (r *RatchetState) DecryptMessage(payload []byte, aad []byte) ([]byte, error
 		return nil, err
 	}
 
+	r.RecvChainKey = nextChain
 	r.RecvMsgNum++
 	return plaintext, nil
 }

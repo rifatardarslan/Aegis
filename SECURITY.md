@@ -1,43 +1,24 @@
-# Security Policy
+# Security policy
 
-## Supported Versions
+Protocol v2 development is supported. Protocol v1 peers must upgrade; there is no automatic downgrade.
 
-| Version | Supported |
-|---------|-----------|
-| 0.1.x   | ✅ Active  |
+Report vulnerabilities privately through GitHub's private vulnerability reporting feature when available, or contact the maintainer listed in the repository profile. Do not publish secret material or exploit details in a public issue before coordination. Include the affected revision, reproduction steps, impact and any suggested fix.
 
-## Reporting a Vulnerability
+## Intended guarantees
 
-If you discover a security vulnerability in Aegis, please report it responsibly.
+- Temporary, random peer identities and explicit connection-request acceptance.
+- Encrypted transport and application packets; the handshake binds the request, transport peers and application public keys.
+- Per-message symmetric key chains, packet authentication and replay/order rejection.
+- Bounded file reception, whole-file integrity checks and explicit saving/overwrite consent.
+- No persistent application chat database, configuration or disk debug log.
+- Best-effort clearing of owned application key/file byte buffers on orderly close.
 
-**DO NOT** open a public GitHub issue for security vulnerabilities.
+## Limits
 
-Instead, please send a detailed report via email or private message to the project maintainers. Include:
+Names are public discovery labels and are not globally unique or proofs of a person's identity. Fingerprints and transcript comparison words are optional; independent trusted comparison is needed for person-level verification. No trusted name directory, persistent trust relationship or anonymity mechanism is provided.
 
-1. **Description** of the vulnerability
-2. **Steps to reproduce** the issue
-3. **Impact assessment** (what can an attacker do?)
-4. **Suggested fix** (if you have one)
+The cipher state uses symmetric key chains, not the complete Signal Double Ratchet; there is no in-session recovery from compromise of current chain keys. The application cryptography is not an independently audited implementation of Signal.
 
-We will acknowledge receipt within 48 hours and provide a timeline for a fix.
+Public DHT and relay infrastructure can observe metadata and retain discovery records beyond a local session's lifetime. Disabling findability stops new advertisements and hides the live name but cannot erase existing network records immediately.
 
-## Security Design Principles
-
-Aegis is built with the following security principles:
-
-- **Zero-Trust Architecture**: Neither the network nor local storage is trusted
-- **Memory-Only Operation**: No databases, logs, or config files are written to disk
-- **Ephemeral Keys**: All cryptographic keys are session-scoped and never persisted
-- **Forward Secrecy**: Double Ratchet protocol ensures per-message key derivation
-- **Explicit Verification**: Out-of-band SAS and fingerprint comparison before chat
-
-## Scope
-
-The following are considered in-scope for security reports:
-
-- Cryptographic implementation flaws
-- Memory zeroization bypass
-- Man-in-the-Middle attack vectors
-- Replay or spoofing attack vectors
-- Information disclosure through side channels
-- Any mechanism that writes sensitive data to disk
+Go/runtime/library copies, swap, terminal capture, crash dumps, compromised devices, power loss and uncatchable termination prevent guarantees of complete memory erasure. User-requested file saving deliberately writes to disk and can leave a staging file after a crash. Unix mode 0600 does not promise equivalent Windows ACL protection. Debug stderr can be persisted by an external shell or supervisor.

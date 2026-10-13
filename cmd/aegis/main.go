@@ -14,10 +14,10 @@ import (
 )
 
 var (
-	// debugMode enables verbose diagnostic output — never logs cryptographic material.
-	debugMode = flag.Bool("debug", false, "enable debug output (never logs key material)")
-	// relay allows overriding the default IPFS bootstrap peers with a custom multiaddr.
-	relay = flag.String("relay", "", "custom relay peer multiaddr (phase 2+)")
+	// debugMode enables fixed, non-sensitive stderr diagnostic categories.
+	debugMode = flag.Bool("debug", false, "enable non-sensitive diagnostic categories on stderr")
+	// relay adds a preferred custom circuit relay candidate.
+	relay = flag.String("relay", "", "custom relay peer multiaddr")
 	// downloads specifies the default directory where received files are saved.
 	downloads = flag.String("downloads", "", "default directory for downloaded files")
 )
@@ -29,26 +29,36 @@ func main() {
 	p := tea.NewProgram(
 		m,
 		tea.WithAltScreen(),
+		tea.WithoutSignalHandler(),
 	)
 
 	// Intercept OS interruption/termination signals for secure cleanup
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	programDone := make(chan struct{})
 	go func() {
-		<-sigChan
-		p.Quit()
+		for {
+			select {
+			case <-programDone:
+				return
+			case <-sigChan:
+				p.Send(tea.KeyMsg{Type: tea.KeyCtrlC})
+			}
+		}
 	}()
 
 	finalModel, err := p.Run()
+	close(programDone)
+	signal.Stop(sigChan)
+	switch tm := finalModel.(type) {
+	case tui.Model:
+		tm.Close()
+	case *tui.Model:
+		tm.Close()
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "aegis: fatal:", err)
 		os.Exit(1)
-	}
-
-	if finalModel != nil {
-		if tm, ok := finalModel.(tui.Model); ok {
-			tm.Close()
-		}
 	}
 }

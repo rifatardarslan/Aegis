@@ -2,7 +2,6 @@ package crypto
 
 import (
 	"runtime"
-	"unsafe"
 )
 
 // Bytes explicitly overwrites the backing memory of the slice with zeroes.
@@ -28,19 +27,10 @@ func Array32(a *[32]byte) {
 	runtime.KeepAlive(a)
 }
 
-// String zeroes out the backing memory of a string directly.
-// WARNING: This mutates the string's backing array which is technically immutable in Go.
-// It should only be used for sensitive in-memory strings that are about to be discarded.
+// String releases this reference. Go strings cannot safely be overwritten;
+// callers should use owned byte buffers for secret material.
 func String(s *string) {
-	if s == nil || *s == "" {
-		return
+	if s != nil {
+		*s = ""
 	}
-	// Direct slice of the string's underlying backing array to mutate it in place
-	hdr := unsafe.Slice(unsafe.StringData(*s), len(*s))
-	for i := range hdr {
-		hdr[i] = 0
-	}
-	runtime.KeepAlive(hdr)
-	*s = ""
 }
-

@@ -9,19 +9,14 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	circuitv2client "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
-	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/multiformats/go-multiaddr"
 	mh "github.com/multiformats/go-multihash"
 )
-
-// aegisRendezvousNamespace is a fixed string hashed into a CID that all Aegis
-// nodes advertise via DHT Provide(). This acts as a rendezvous point: any Aegis
-// node can call FindProviders() to discover all other online Aegis peers.
-const aegisRendezvousNamespace = "aegis-rendezvous-v1"
 
 // DefaultBootstrapPeers lists public IPFS bootstrap nodes to anchor into Kademlia DHT.
 // Peer IDs and IPs verified 2026-06 via DNS TXT records for _dnsaddr.bootstrap.libp2p.io.
@@ -40,11 +35,10 @@ var DefaultBootstrapPeers = []string{
 
 // DiscoveryManager coordinates peer discovery using Kademlia DHT and mDNS.
 type DiscoveryManager struct {
-	DHT           *dht.IpfsDHT
-	MDNS          mdns.Service
-	host          host.Host
-	customRelay   string
-	rendezvousCID cid.Cid // CID used for rendezvous-based DHT advertising
+	DHT         *dht.IpfsDHT
+	MDNS        mdns.Service
+	host        host.Host
+	customRelay string
 }
 
 type discoveryNotifee struct {
@@ -55,15 +49,10 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	n.h.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
 }
 
-// makeRendezvousCID creates a deterministic CID from the aegis namespace string.
-// All Aegis nodes produce the same CID, making it a global rendezvous point.
-func makeRendezvousCID() cid.Cid {
-	hash := sha256.Sum256([]byte(aegisRendezvousNamespace))
-	multihash, err := mh.Encode(hash[:], mh.SHA2_256)
-	if err != nil {
-		// SHA2_256 is always supported; this should never fail.
-		panic(fmt.Sprintf("failed to create multihash: %v", err))
-	}
+// NameCID maps a normalized name to a versioned discovery namespace.
+func NameCID(name string) cid.Cid {
+	hash := sha256.Sum256([]byte("aegis-name-v2:" + name))
+	multihash, _ := mh.Encode(hash[:], mh.SHA2_256)
 	return cid.NewCidV1(cid.Raw, multihash)
 }
 
@@ -78,8 +67,8 @@ func NewDiscoveryManager(ctx context.Context, h host.Host, customRelay string) (
 
 	// Initialize DHT in AutoServer mode: the node participates in DHT routing
 	// when reachable (serves queries, stores records) and falls back to client
-	// mode when behind restrictive NAT. This is essential for cross-network
-	// peer discovery — ModeClient nodes are invisible to the DHT.
+	// mode when behind restrictive NAT. Provider advertisements are used for
+	// name discovery regardless of whether this node serves routing queries.
 	kademliaDHT, err := dht.New(ctx, h,
 		dht.Mode(dht.ModeAutoServer),
 		dht.BootstrapPeers(bootstrapInfos...),
@@ -90,21 +79,21 @@ func NewDiscoveryManager(ctx context.Context, h host.Host, customRelay string) (
 
 	// Bootstrap triggers FIND_NODE queries — peerstore already populated above.
 	if err := kademliaDHT.Bootstrap(ctx); err != nil {
+		_ = kademliaDHT.Close()
 		return nil, fmt.Errorf("failed to bootstrap DHT: %w", err)
 	}
 
 	dm := &DiscoveryManager{
-		DHT:           kademliaDHT,
-		host:          h,
-		customRelay:   customRelay,
-		rendezvousCID: makeRendezvousCID(),
+		DHT:         kademliaDHT,
+		host:        h,
+		customRelay: customRelay,
 	}
 
 	// mDNS for same-LAN discovery.
 	notifee := &discoveryNotifee{h: h}
 	mdnsService := mdns.NewMdnsService(h, "aegis-p2p-mdns", notifee)
 	if err := mdnsService.Start(); err != nil {
-		fmt.Printf("[Discovery] mDNS service failed: %v\n", err)
+		// LAN discovery is optional; WAN discovery remains available.
 	} else {
 		dm.MDNS = mdnsService
 	}
@@ -144,24 +133,18 @@ func NewDiscoveryManager(ctx context.Context, h host.Host, customRelay string) (
 	return dm, nil
 }
 
-// StartAdvertising begins the rendezvous-based DHT advertising loop.
-// It calls DHT Provide() to announce this node under the shared Aegis CID,
-// making it discoverable by any other Aegis node via FindProviders().
-func (dm *DiscoveryManager) StartAdvertising(ctx context.Context) {
+// StartAdvertising periodically refreshes this name while discoverability is enabled.
+func (dm *DiscoveryManager) StartAdvertising(ctx context.Context, name string) {
 	go func() {
-		// Wait for DHT to be bootstrapped before advertising.
 		dm.waitForBootstrap(ctx, 30*time.Second)
-
-		for {
+		for ctx.Err() == nil {
 			provideCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			_ = dm.DHT.Provide(provideCtx, dm.rendezvousCID, true)
+			_ = dm.DHT.Provide(provideCtx, NameCID(name), true)
 			cancel()
-
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(10 * time.Minute):
-				// Re-advertise every 10 minutes to keep DHT records fresh.
+			case <-time.After(5 * time.Minute):
 			}
 		}
 	}()
@@ -191,7 +174,7 @@ func parseBootstrapPeers(addrs []string, customRelay string) []peer.AddrInfo {
 
 // reserveRelays explicitly attempts circuit relay v2 RESERVE on each public relay node.
 func (dm *DiscoveryManager) reserveRelays(ctx context.Context) {
-	relayInfos := GetRelayAddrInfos()
+	relayInfos := relayAddrInfos(dm.customRelay)
 	var wg sync.WaitGroup
 	for _, ri := range relayInfos {
 		wg.Add(1)
@@ -226,7 +209,6 @@ func (dm *DiscoveryManager) connectToBootstrap(ctx context.Context) {
 // FindPeer searches for the target PeerID using multiple strategies:
 // 1. Local peerstore cache (covers mDNS and previously connected peers)
 // 2. Direct DHT FindPeer lookup
-// 3. Rendezvous-based FindProviders fallback (discovers all Aegis nodes)
 func (dm *DiscoveryManager) FindPeer(ctx context.Context, targetID peer.ID) (peer.AddrInfo, error) {
 	// 1. Check peerstore cache first (covers mDNS-discovered and previously connected peers).
 	if addrs := dm.host.Peerstore().Addrs(targetID); len(addrs) > 0 {
@@ -253,28 +235,7 @@ func (dm *DiscoveryManager) FindPeer(ctx context.Context, targetID peer.ID) (pee
 		return pi, nil
 	}
 
-	// 4. Fallback: search the Aegis rendezvous namespace via FindProviders.
-	// This discovers all online Aegis nodes and checks if the target is among them.
-	providersCtx, provCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer provCancel()
-
-	providersCh := dm.DHT.FindProvidersAsync(providersCtx, dm.rendezvousCID, 50)
-	for provider := range providersCh {
-		if provider.ID == targetID {
-			return provider, nil
-		}
-		// Even if not our target, add discovered Aegis peers to peerstore
-		// so DHT routing improves over time.
-		dm.host.Peerstore().AddAddrs(provider.ID, provider.Addrs, time.Hour)
-	}
-
-	// Check peerstore one more time — the DHT walk during FindProviders may
-	// have populated routing information for our target as a side-effect.
-	if addrs := dm.host.Peerstore().Addrs(targetID); len(addrs) > 0 {
-		return peer.AddrInfo{ID: targetID, Addrs: addrs}, nil
-	}
-
-	return peer.AddrInfo{}, fmt.Errorf("peer not found in DHT or rendezvous: %w", err)
+	return peer.AddrInfo{}, fmt.Errorf("peer not found in DHT: %w", err)
 }
 
 // waitForBootstrap polls the routing table until non-empty or timeout.

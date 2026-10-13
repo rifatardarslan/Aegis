@@ -1,1393 +1,524 @@
 package tui
 
 import (
-	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
-
+	"github.com/aegis-p2p/aegis/internal/crypto"
+	"github.com/aegis-p2p/aegis/internal/p2p"
+	"github.com/aegis-p2p/aegis/internal/transfer"
 	"github.com/charmbracelet/bubbles/filepicker"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-
-	"github.com/aegis-p2p/aegis/internal/crypto"
-	"github.com/aegis-p2p/aegis/internal/p2p"
-	"github.com/aegis-p2p/aegis/internal/transfer"
-)
-
-// MaxFileTransferSize is the maximum file size (100 MB) accepted for in-memory file transfers.
-// This prevents memory exhaustion attacks from malicious peers.
-const MaxFileTransferSize = 100 * 1024 * 1024 // 100 MB
-
-// ── File Transfer State Enums ────────────────────────────────────────────────
-
-type SenderState int
-
-const (
-	SenderIdle SenderState = iota
-	SenderWaitAccept
-	SenderSending
-	SenderDone
-	SenderRejected
-	SenderError
-)
-
-type ReceiverState int
-
-const (
-	ReceiverIdle ReceiverState = iota
-	ReceiverOfferReceived
-	ReceiverReceiving
-	ReceiverSavePrompt
-	ReceiverSaving
-	ReceiverDone
-	ReceiverError
-)
-
-// ── Model Structures ──────────────────────────────────────────────────────────
-
-type MessageStatus int
-
-const (
-	StatusSent MessageStatus = iota
-	StatusDelivered
-	StatusRead
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+	"unicode"
 )
 
 type chatMessage struct {
-	ID        uint64
-	Sender    string // YOU, PEER, or SYSTEM
-	Timestamp time.Time
-	Text      string
-	Status    MessageStatus
+	ID                   int
+	Sender, Text, Status string
+	Timestamp            time.Time
+}
+type chatTick time.Time
+type preparedFile struct {
+	Generation uint64
+	Upload     *transfer.Upload
+	Err        error
+}
+type saveResult struct {
+	Err  error
+	Path string
+}
+type sendResult struct {
+	Err       error
+	MessageID int
+}
+type chunkResult struct {
+	Err        error
+	TransferID string
 }
 
-// ChatModel is the TUI controller for the secure, zero-trust chat room.
 type ChatModel struct {
-	width, height int
-	peerHandle    string
-	p2pNode       *p2p.P2PNode
-	input         textinput.Model
-	chatHistory   []chatMessage
-
-	// File transfer state (Sender)
-	fileMode    bool
-	filePath    string
-	sendState   SenderState
-
-	// File transfer state (Receiver)
-	saveMode      bool
-	savePath      string
-	recvState     ReceiverState
-	recvFileBytes []byte
-
-	// Shared transfer metadata
-	fileName    string
-	fileSize    int64
-	fileHash    string
-	totalChunks int
-	currChunk   int
-	transferErr string
-
-	// Usability additions
-	defaultDownloads string
-	viewport         viewport.Model
-
-	// Typing state
-	peerTyping     bool
-	lastTypingTime time.Time
-	lastTypingSent time.Time
-
-	// Diagnostics state
-	rtt            time.Duration
-	connectionType string
-
-	// Picker state
-	filepicker filepicker.Model
-	pickerMode bool
+	width, height                           int
+	session                                 *p2p.Session
+	engine                                  *transfer.Engine
+	input                                   textinput.Model
+	viewport                                viewport.Model
+	history                                 []chatMessage
+	nextMessageID                           int
+	downloads                               string
+	filepicker                              filepicker.Model
+	pickerMode, fileMode, saveMode          bool
+	preparing                               bool
+	prepareGeneration                       uint64
+	overwritePrompt                         bool
+	savePath                                string
+	saving                                  bool
+	closePrompt, closeLost, finishAfterSave bool
+	showDetails                             bool
+	peerTypingUntil, lastTyping             time.Time
+	rtt                                     time.Duration
+	lastPing                                int64
 }
 
-// NewChat initializes a clean chat screen in idle mode.
-func NewChat(defaultDownloads string) ChatModel {
-	inp := textinput.New()
-	inp.Placeholder = "type a secure message..."
-	inp.CharLimit = 1024
-	inp.Width = 80
-	inp.Prompt = "  > "
-	inp.PromptStyle = PrimaryBold
-	inp.TextStyle = PrimaryText
-	inp.PlaceholderStyle = MutedText
-	inp.Focus()
-
-	return ChatModel{
-		input:            inp,
-		sendState:        SenderIdle,
-		recvState:        ReceiverIdle,
-		defaultDownloads: defaultDownloads,
-	}
+func NewChat(downloads string, s *p2p.Session) ChatModel {
+	input := textinput.New()
+	input.CharLimit = 1024
+	input.Placeholder = "type a message..."
+	input.Prompt = " > "
+	input.Focus()
+	return ChatModel{input: input, session: s, engine: &transfer.Engine{}, downloads: downloads}
 }
-
-type pingTickMsg time.Time
-
-func pingTickCmd() tea.Cmd {
-	return tea.Tick(10*time.Second, func(t time.Time) tea.Msg {
-		return pingTickMsg(t)
+func (m ChatModel) Init() tea.Cmd { return tea.Batch(textinput.Blink, m.tick()) }
+func (m ChatModel) tick() tea.Cmd {
+	s := m.session
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return chatEvent{s, chatTick(t)} })
+}
+func (m ChatModel) async(work func() any) tea.Cmd {
+	s := m.session
+	return func() tea.Msg { return chatEvent{s, work()} }
+}
+func (m ChatModel) send(frame transfer.AegisFrame, id int) tea.Cmd {
+	s := m.session
+	return m.async(func() any {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err := s.Send(ctx, frame)
+		return sendResult{err, id}
 	})
 }
-
-func (m ChatModel) Init() tea.Cmd {
-	return pingTickCmd()
+func (m ChatModel) chunk() tea.Cmd {
+	engine, s := m.engine, m.session
+	transferID := engine.Snapshot().ID
+	return m.async(func() any {
+		frame, err := engine.NextChunk()
+		id := transferID
+		if err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err = s.Send(ctx, frame)
+			cancel()
+		}
+		crypto.Bytes(frame.Data)
+		return chunkResult{err, id}
+	})
 }
-
+func (m *ChatModel) add(sender, text, status string, id int) {
+	m.history = append(m.history, chatMessage{ID: id, Sender: sender, Text: text, Status: status, Timestamp: time.Now()})
+	if len(m.history) > 1000 {
+		m.history = append([]chatMessage(nil), m.history[len(m.history)-1000:]...)
+	}
+	m.refresh()
+}
+func (m *ChatModel) addSystem(text string) { m.add("SYS", text, "", -1) }
+func (m *ChatModel) refresh() {
+	atBottom := m.viewport.AtBottom()
+	offset := m.viewport.YOffset
+	lines := make([]string, 0, len(m.history))
+	for _, entry := range m.history {
+		text := strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) && r != '\n' && r != '\t' {
+				return -1
+			}
+			return r
+		}, entry.Text)
+		sender := entry.Sender
+		if sender == "PEER" && m.session != nil && m.session.PeerName != "" {
+			sender = m.session.PeerName
+		}
+		lines = append(lines, fmt.Sprintf("%s %s › %s %s", entry.Timestamp.Format("15:04:05"), sender, text, entry.Status))
+	}
+	m.viewport.SetContent(lipgloss.NewStyle().Width(max(10, m.viewport.Width)).Render(strings.Join(lines, "\n")))
+	if atBottom {
+		m.viewport.GotoBottom()
+	} else {
+		m.viewport.SetYOffset(offset)
+	}
+}
 func (m ChatModel) UpdateSize(w, h int) (ChatModel, tea.Cmd) {
-	m.width, m.height = w, h
-
-	sidebarW := 34
-	chatW := m.width - sidebarW - 1
-	if chatW < 20 {
-		chatW = 20
-	}
-	chatHeight := m.height - 8
-	if chatHeight < 5 {
-		chatHeight = 5
-	}
-	m.viewport.Width = chatW
-	m.viewport.Height = chatHeight
-	m.viewport.KeyMap = viewport.DefaultKeyMap()
-	m.updateViewportContent()
+	m.width = w
+	m.height = h
+	m.viewport.Width = max(10, w-6)
+	m.viewport.Height = max(3, h-12)
+	m.input.Width = max(10, w-8)
+	m.refresh()
 	return m, nil
 }
-
-func (m *ChatModel) updateViewportContent() {
-	sidebarW := 34
-	chatW := m.width - sidebarW - 1
-	if chatW < 20 {
-		chatW = 20
+func (m *ChatModel) prepare(path string) tea.Cmd {
+	if m.preparing || m.engine.Snapshot().Busy {
+		m.addSystem("Another transfer is active.")
+		return nil
 	}
-	chatHeight := m.height - 8
-	if chatHeight < 5 {
-		chatHeight = 5
-	}
-	m.viewport.Width = chatW
-	m.viewport.Height = chatHeight
-	m.viewport.SetContent(m.renderChatContent(chatW, chatHeight))
-	m.viewport.GotoBottom()
+	m.preparing = true
+	m.prepareGeneration++
+	gen := m.prepareGeneration
+	return m.async(func() any { u, err := transfer.Prepare(path); return preparedFile{gen, u, err} })
 }
-
-func (m ChatModel) renderChatContent(chatW, chatHeight int) string {
-	var chatLines []string
-	for _, msg := range m.chatHistory {
-		timeStr := TimestampStyle.Render(msg.Timestamp.Format("15:04:05"))
-		var handle string
-		if msg.Sender == "YOU" {
-			handle = HandleSelfStyle.Render("YOU")
-		} else if msg.Sender == "PEER" {
-			handle = HandlePeerStyle.Render("PEER")
-		} else {
-			handle = WarningBold.Render("SYS")
+func (m *ChatModel) save(overwrite bool) tea.Cmd {
+	m.saving = true
+	engine, path, s := m.engine, m.savePath, m.session
+	return m.async(func() any {
+		frame, err := engine.Save(path, overwrite)
+		if err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = s.Send(ctx, frame)
+			cancel()
 		}
-
-		runes := []rune(msg.Text)
-		maxTextW := chatW - 18
-		if maxTextW < 10 {
-			maxTextW = 10
-		}
-
-		var chatMsgLines []string
-		for len(runes) > maxTextW {
-			chatMsgLines = append(chatMsgLines, MsgStyle.Render(string(runes[:maxTextW])))
-			runes = runes[maxTextW:]
-		}
-		chatMsgLines = append(chatMsgLines, MsgStyle.Render(string(runes)))
-
-		// Append status icon to the last line of YOU messages
-		if msg.Sender == "YOU" {
-			var statusIcon string
-			switch msg.Status {
-			case StatusSent:
-				statusIcon = SubtleText.Render(" ✓")
-			case StatusDelivered:
-				statusIcon = SecondaryText.Render(" ✓")
-			case StatusRead:
-				statusIcon = PrimaryBold.Render(" ✓✓")
-			}
-			chatMsgLines[len(chatMsgLines)-1] += statusIcon
-		}
-
-		for i, line := range chatMsgLines {
-			if i > 0 {
-				timeStr = "        "
-				handle = "    "
-			}
-			chatLines = append(chatLines, fmt.Sprintf("%s %s › %s", timeStr, handle, line))
-		}
-	}
-
-	return strings.Join(chatLines, "\n")
-}
-
-// ── Cryptographic Send Helper ────────────────────────────────────────────────
-
-func sendFrame(node *p2p.P2PNode, frame transfer.AegisFrame) error {
-	if node == nil || node.ActiveStream == nil || node.Ratchet == nil {
-		return fmt.Errorf("no active connection stream")
-	}
-
-	// 1. Marshal to JSON plaintext
-	plaintext, err := json.Marshal(frame)
-	if err != nil {
-		return fmt.Errorf("failed to marshal frame: %w", err)
-	}
-	defer crypto.Bytes(plaintext)
-
-	// 2. Generate symmetric AAD from Peer IDs
-	peerA := node.Host.ID().String()
-	peerB := node.ActiveStream.Conn().RemotePeer().String()
-	var aad []byte
-	if peerA < peerB {
-		aad = []byte(peerA + ":" + peerB)
-	} else {
-		aad = []byte(peerB + ":" + peerA)
-	}
-
-	// 3. Encrypt using Double Ratchet
-	ciphertext, err := node.Ratchet.EncryptMessage(plaintext, aad)
-	if err != nil {
-		return fmt.Errorf("ratchet encryption failed: %w", err)
-	}
-
-	// 4. Sign using Ed25519
-	sig := ed25519.Sign(node.Identity.PrivateKey, ciphertext)
-
-	// 5. Pack [Signature (64B)][Ciphertext]
-	payload := make([]byte, 64+len(ciphertext))
-	copy(payload[:64], sig)
-	copy(payload[64:], ciphertext)
-
-	// 6. Write frame length-prefixed
-	if err := p2p.WriteFrame(node.ActiveStream, payload); err != nil {
-		return fmt.Errorf("failed to write wire packet: %w", err)
-	}
-
-	return nil
-}
-
-// ── Chunk Sending Command ────────────────────────────────────────────────────
-
-type p2pChunkSentSuccessMsg struct {
-	Index int
-}
-
-type p2pChunkSendErrorMsg struct {
-	Err error
-}
-
-func sendNextChunkCmd(node *p2p.P2PNode, filePath string, chunkIndex int, fileName string) tea.Cmd {
-	return func() tea.Msg {
-		file, err := os.Open(filePath)
-		if err != nil {
-			return p2pChunkSendErrorMsg{Err: err}
-		}
-		defer file.Close()
-
-		const ChunkSize = 256 * 1024 // 256 KB chunks
-		_, err = file.Seek(int64(chunkIndex)*ChunkSize, io.SeekStart)
-		if err != nil {
-			return p2pChunkSendErrorMsg{Err: err}
-		}
-
-		buf := make([]byte, ChunkSize)
-		defer crypto.Bytes(buf)
-		n, err := file.Read(buf)
-		if err != nil && err != io.EOF {
-			return p2pChunkSendErrorMsg{Err: err}
-		}
-
-		frame := transfer.AegisFrame{
-			Type:  transfer.TypeChunk,
-			Name:  fileName,
-			Index: chunkIndex,
-			Data:  buf[:n],
-		}
-
-		if err := sendFrame(node, frame); err != nil {
-			return p2pChunkSendErrorMsg{Err: err}
-		}
-
-		return p2pChunkSentSuccessMsg{Index: chunkIndex}
-	}
-}
-
-// ── Update Logic ─────────────────────────────────────────────────────────────
-
-type clearTypingMsg struct {
-	Time time.Time
-}
-
-func triggerClearTypingCmd(t time.Time) tea.Cmd {
-	return tea.Tick(2600*time.Millisecond, func(_ time.Time) tea.Msg {
-		return clearTypingMsg{Time: t}
+		return saveResult{err, path}
 	})
 }
-
+func (m *ChatModel) beginSave() {
+	m.saveMode = true
+	m.overwritePrompt = false
+	m.input.CharLimit = 4096
+	m.input.Placeholder = "save path or existing directory..."
+	value := ""
+	if m.downloads != "" {
+		value = filepath.Join(m.downloads, m.engine.Snapshot().Name)
+	}
+	m.input.SetValue(value)
+	m.input.Focus()
+}
+func (m *ChatModel) normalInput() {
+	m.fileMode = false
+	m.saveMode = false
+	m.input.CharLimit = 1024
+	m.input.SetValue("")
+	m.input.Placeholder = "type a message..."
+	m.input.Focus()
+}
 func (m ChatModel) Update(msg tea.Msg) (ChatModel, tea.Cmd) {
-	var cmds []tea.Cmd
-
-	if m.pickerMode {
-		// Only intercept if the message is NOT one of our custom P2P/TUI messages.
-		// This ensures network and custom timer events fall through to the main switch
-		// and don't get lost, while key presses, window sizes, and filepicker internal
-		// commands (like readDirMsg) are correctly routed to the filepicker.
-		switch msg.(type) {
-		case clearTypingMsg, pingTickMsg, p2pMessageReceivedMsg, p2pChunkSentSuccessMsg, p2pChunkSendErrorMsg, p2pFileFrameMsg:
-			// Let these fall through to the main switch!
-		default:
-			// Intercept Esc key to cancel filepicker mode
-			if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.Type == tea.KeyEsc {
-				m.pickerMode = false
-				return m, nil
-			}
-
-			var fpCmd tea.Cmd
-			m.filepicker, fpCmd = m.filepicker.Update(msg)
-
-			// Check if a file was selected
-			if didSelect, path := m.filepicker.DidSelectFile(msg); didSelect {
-				m.pickerMode = false
-
-				fi, err := os.Stat(path)
-				if err != nil {
-					m.sendState = SenderError
-					m.transferErr = fmt.Sprintf("file not found: %s", err)
-					return m, nil
-				}
-
-				m.filePath = path
-				m.fileName = filepath.Base(path)
-				m.fileSize = fi.Size()
-
-				if m.fileSize == 0 {
-					m.sendState = SenderError
-					m.transferErr = "empty files not supported"
-					return m, nil
-				}
-
-				if m.fileSize > MaxFileTransferSize {
-					m.sendState = SenderError
-					m.transferErr = fmt.Sprintf("file too large (%d MB max)", MaxFileTransferSize/(1024*1024))
-					return m, nil
-				}
-
-				const ChunkSize = 256 * 1024
-				m.totalChunks = int((m.fileSize + ChunkSize - 1) / ChunkSize)
-
-				hash, err := transfer.HashFile(path)
-				if err != nil {
-					m.sendState = SenderError
-					m.transferErr = err.Error()
-					return m, nil
-				}
-				m.fileHash = hash
-
-				offerFrame := transfer.AegisFrame{
-					Type:   transfer.TypeFileOffer,
-					Name:   m.fileName,
-					Size:   m.fileSize,
-					Chunks: m.totalChunks,
-					SHA256: m.fileHash,
-				}
-
-				if err := sendFrame(m.p2pNode, offerFrame); err != nil {
-					m.sendState = SenderError
-					m.transferErr = err.Error()
-					return m, nil
-				}
-
-				m.sendState = SenderWaitAccept
-				m.currChunk = 0
-				return m, nil
-			}
-
-			return m, fpCmd
+	switch v := msg.(type) {
+	case chatTick:
+		now := time.Time(v)
+		cmds := []tea.Cmd{m.tick()}
+		if frame, expired := m.engine.Expire(now); expired {
+			m.addSystem("Transfer timed out; you can try again.")
+			cmds = append(cmds, m.send(frame, -1))
 		}
-	}
-
-	switch msg := msg.(type) {
-	case clearTypingMsg:
-		if m.peerTyping && time.Since(m.lastTypingTime) >= 2500*time.Millisecond {
-			m.peerTyping = false
+		if m.lastPing == 0 || now.UnixNano()-m.lastPing >= int64(10*time.Second) {
+			m.lastPing = now.UnixNano()
+			cmds = append(cmds, m.send(transfer.AegisFrame{Type: transfer.TypePing, Size: m.lastPing}, -1))
+		}
+		return m, tea.Batch(cmds...)
+	case preparedFile:
+		if v.Generation != m.prepareGeneration {
+			if v.Upload != nil {
+				v.Upload.Close()
+			}
+			return m, nil
+		}
+		m.preparing = false
+		if v.Err != nil {
+			m.addSystem("File preparation failed: " + v.Err.Error())
+			return m, nil
+		}
+		frame, err := m.engine.Offer(v.Upload)
+		if err != nil {
+			m.addSystem(err.Error())
+			return m, nil
+		}
+		m.addSystem("File offer sent: " + frame.Name)
+		return m, m.send(frame, -1)
+	case saveResult:
+		m.saving = false
+		m.overwritePrompt = false
+		if errors.Is(v.Err, transfer.ErrExists) {
+			m.overwritePrompt = true
+			return m, nil
+		}
+		if v.Err != nil {
+			m.addSystem("Save failed: " + v.Err.Error() + ". The file is still in memory; retry with Ctrl+S.")
+			if m.finishAfterSave {
+				m.closePrompt = true
+			}
+			return m, nil
+		}
+		m.addSystem("File saved to " + v.Path)
+		m.normalInput()
+		if m.finishAfterSave {
+			return m, func() tea.Msg { return closeConfirmedMsg{} }
 		}
 		return m, nil
-
-	case pingTickMsg:
-		if m.p2pNode != nil && m.p2pNode.ActiveStream != nil {
-			pingFrame := transfer.AegisFrame{
-				Type: transfer.TypePing,
-				Size: time.Now().UnixNano(),
-			}
-			if err := sendFrame(m.p2pNode, pingFrame); err != nil {
-				return m, func() tea.Msg { return p2pDisconnectMsg{Err: err} }
-			}
-			m.connectionType = m.p2pNode.GetConnectionType()
-		}
-		return m, pingTickCmd()
-	case tea.KeyMsg:
-		// Intercept Y/N keys directly if we are prompting for a file accept/reject
-		if m.recvState == ReceiverOfferReceived {
-			switch strings.ToLower(msg.String()) {
-			case "y":
-				LogDebug("Receiver: user pressed Y. m.fileSize=%d", m.fileSize)
-				m.recvState = ReceiverReceiving
-				m.currChunk = 0
-				m.recvFileBytes = make([]byte, 0, m.fileSize)
-
-				acceptFrame := transfer.AegisFrame{
-					Type: transfer.TypeFileAccept,
-				}
-				if err := sendFrame(m.p2pNode, acceptFrame); err != nil {
-					LogDebug("Receiver: failed to send TypeFileAccept frame: %v", err)
-					m.recvState = ReceiverError
-					m.transferErr = err.Error()
-					m.chatHistory = append(m.chatHistory, chatMessage{
-						Sender:    "SYSTEM",
-						Timestamp: time.Now(),
-						Text:      fmt.Sprintf("✗ Error accepting file offer: %v", err),
-					})
-				} else {
-					LogDebug("Receiver: successfully sent TypeFileAccept frame.")
-					m.chatHistory = append(m.chatHistory, chatMessage{
-						Sender:    "SYSTEM",
-						Timestamp: time.Now(),
-						Text:      fmt.Sprintf("✓ Accepted file offer for '%s'. Receiving...", m.fileName),
-					})
-				}
-				m.updateViewportContent()
-				m.input.Focus()
-				return m, nil
-
-			case "n":
-				LogDebug("Receiver: user pressed N. Rejecting file offer.")
-				m.recvState = ReceiverIdle
-
-				rejectFrame := transfer.AegisFrame{
-					Type: transfer.TypeFileReject,
-				}
-				_ = sendFrame(m.p2pNode, rejectFrame)
-				m.chatHistory = append(m.chatHistory, chatMessage{
-					Sender:    "SYSTEM",
-					Timestamp: time.Now(),
-					Text:      fmt.Sprintf("✗ Rejected file offer for '%s'.", m.fileName),
-				})
-				m.updateViewportContent()
-				m.input.Focus()
-				return m, nil
-			}
-		}
-
-		// Scroll viewport with key Up, Down, PageUp, PageDown if not in file or save modes
-		if !m.fileMode && !m.saveMode {
-			switch msg.Type {
-			case tea.KeyUp, tea.KeyDown, tea.KeyPgUp, tea.KeyPgDown:
-				var vpCmd tea.Cmd
-				m.viewport, vpCmd = m.viewport.Update(msg)
-				return m, vpCmd
-			}
-
-			// Send typing notification on typing activity
-			if msg.Type == tea.KeyRunes || msg.Type == tea.KeyBackspace || msg.Type == tea.KeySpace {
-				if time.Since(m.lastTypingSent) > 2*time.Second {
-					m.lastTypingSent = time.Now()
-					typingFrame := transfer.AegisFrame{
-						Type: transfer.TypeTyping,
-					}
-					_ = sendFrame(m.p2pNode, typingFrame)
-				}
-			}
-		}
-
-		// Handle control shortcuts
-		switch msg.Type {
-		case tea.KeyCtrlF:
-			if !m.fileMode && !m.saveMode && m.sendState == SenderIdle && m.recvState == ReceiverIdle {
-				m.pickerMode = true
-				m.filepicker = filepicker.New()
-				m.filepicker.CurrentDirectory, _ = os.Getwd()
-				m.filepicker.Styles.Cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("#000000")).Background(ColorPrimary).Bold(true)
-				m.filepicker.Styles.Directory = lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true)
-				m.filepicker.Styles.File = lipgloss.NewStyle().Foreground(ColorWhite)
-				m.filepicker.Styles.Permission = lipgloss.NewStyle().Foreground(ColorSubtle)
-				m.filepicker.Styles.Selected = lipgloss.NewStyle().Foreground(ColorPrimary).Underline(true)
-				return m, m.filepicker.Init()
-			}
+	case sendResult:
+		if v.Err != nil {
+			m.addSystem("Send failed: " + v.Err.Error())
+			LogDebug("transfer failed")
 			return m, nil
-
-		case tea.KeyCtrlO:
-			if !m.fileMode && !m.saveMode && m.sendState == SenderIdle && m.recvState == ReceiverIdle {
-				m.fileMode = true
-				m.input.Placeholder = "enter absolute file path..."
-				m.input.SetValue("")
-				m.input.Focus()
-			}
-			return m, nil
-
-		case tea.KeyCtrlS:
-			if m.recvState == ReceiverSavePrompt {
-				m.saveMode = true
-				m.input.Placeholder = "enter save path on disk..."
-				if m.defaultDownloads != "" {
-					m.input.SetValue(filepath.Join(m.defaultDownloads, m.fileName))
-				} else {
-					m.input.SetValue("")
-				}
-			}
-			return m, nil
-
-		case tea.KeyEsc:
-			if m.fileMode {
-				m.fileMode = false
-				m.input.Placeholder = "type a secure message..."
-				m.input.SetValue("")
-			} else if m.saveMode {
-				m.saveMode = false
-				m.input.Placeholder = "type a secure message..."
-				m.input.SetValue("")
-			}
-			return m, nil
-
-		case tea.KeyEnter:
-			if m.fileMode {
-				filePath := strings.TrimSpace(m.input.Value())
-				m.input.SetValue("")
-				m.input.Placeholder = "type a secure message..."
-				m.fileMode = false
-
-				if filePath == "" {
-					return m, nil
-				}
-
-				fi, err := os.Stat(filePath)
-				if err != nil {
-					m.sendState = SenderError
-					m.transferErr = fmt.Sprintf("file not found: %s", err)
-					return m, nil
-				}
-
-				m.filePath = filePath
-				m.fileName = filepath.Base(filePath)
-				m.fileSize = fi.Size()
-
-				if m.fileSize == 0 {
-					m.sendState = SenderError
-					m.transferErr = "empty files not supported"
-					return m, nil
-				}
-
-				if m.fileSize > MaxFileTransferSize {
-					m.sendState = SenderError
-					m.transferErr = fmt.Sprintf("file too large (%d MB max)", MaxFileTransferSize/(1024*1024))
-					return m, nil
-				}
-
-				const ChunkSize = 256 * 1024
-				m.totalChunks = int((m.fileSize + ChunkSize - 1) / ChunkSize)
-
-				// Hashing the file in a streaming way
-				hash, err := transfer.HashFile(filePath)
-				if err != nil {
-					m.sendState = SenderError
-					m.transferErr = err.Error()
-					return m, nil
-				}
-				m.fileHash = hash
-
-				offerFrame := transfer.AegisFrame{
-					Type:   transfer.TypeFileOffer,
-					Name:   m.fileName,
-					Size:   m.fileSize,
-					Chunks: m.totalChunks,
-					SHA256: m.fileHash,
-				}
-
-				if err := sendFrame(m.p2pNode, offerFrame); err != nil {
-					m.sendState = SenderError
-					m.transferErr = err.Error()
-					return m, nil
-				}
-
-				m.sendState = SenderWaitAccept
-				m.currChunk = 0
-				return m, nil
-
-			} else if m.saveMode {
-				savePath := strings.TrimSpace(m.input.Value())
-				m.input.SetValue("")
-				m.input.Placeholder = "type a secure message..."
-				m.saveMode = false
-
-				if savePath == "" {
-					return m, nil
-				}
-
-				// Sanitize and resolve the save path to prevent path traversal
-				savePath = filepath.Clean(savePath)
-				absPath, err := filepath.Abs(savePath)
-				if err != nil {
-					m.recvState = ReceiverError
-					m.transferErr = "invalid save path"
-					m.chatHistory = append(m.chatHistory, chatMessage{
-						Sender:    "SYSTEM",
-						Timestamp: time.Now(),
-						Text:      "✗ Save failed: invalid save path",
-					})
-					m.updateViewportContent()
-					return m, nil
-				}
-				savePath = absPath
-
-				// Auto-append filename if save path is an existing directory
-				fi, err := os.Stat(savePath)
-				if err == nil && fi.IsDir() {
-					savePath = filepath.Join(savePath, m.fileName)
-				}
-
-				// Ensure parent directory exists
-				dir := filepath.Dir(savePath)
-				if err := os.MkdirAll(dir, 0755); err != nil {
-					m.recvState = ReceiverError
-					m.transferErr = fmt.Sprintf("failed to create directory: %v", err)
-					m.chatHistory = append(m.chatHistory, chatMessage{
-						Sender:    "SYSTEM",
-						Timestamp: time.Now(),
-						Text:      fmt.Sprintf("✗ File save failed: %v", err),
-					})
-					m.updateViewportContent()
-					return m, nil
-				}
-
-				m.savePath = savePath
-
-				m.recvState = ReceiverSaving
-				err = transfer.SaveFile(savePath, m.recvFileBytes)
-				if err != nil {
-					m.recvState = ReceiverError
-					m.transferErr = err.Error()
-					m.chatHistory = append(m.chatHistory, chatMessage{
-						Sender:    "SYSTEM",
-						Timestamp: time.Now(),
-						Text:      fmt.Sprintf("✗ File save failed: %v", err),
-					})
-					m.updateViewportContent()
-					return m, nil
-				}
-
-				// RAM Security: zeroize received bytes
-				crypto.Bytes(m.recvFileBytes)
-				m.recvFileBytes = nil
-
-				m.recvState = ReceiverDone
-				m.chatHistory = append(m.chatHistory, chatMessage{
-					Sender:    "SYSTEM",
-					Timestamp: time.Now(),
-					Text:      fmt.Sprintf("✓ File '%s' saved securely to: %s", m.fileName, savePath),
-				})
-				m.updateViewportContent()
-				return m, nil
-
-			} else {
-				val := strings.TrimSpace(m.input.Value())
-				if val != "" {
-					m.input.SetValue("")
-
-					// 1. Process valid slash commands
-					isCmd := false
-					if strings.HasPrefix(val, "/") {
-						parts := strings.Fields(val)
-						cmdName := strings.ToLower(parts[0])
-						switch cmdName {
-						case "/clear", "/quit", "/disconnect", "/status", "/help":
-							isCmd = true
-						}
-					}
-
-					if isCmd {
-						parts := strings.Fields(val)
-						cmdName := strings.ToLower(parts[0])
-						switch cmdName {
-						case "/clear":
-							m.chatHistory = nil
-							m.updateViewportContent()
-							return m, nil
-
-						case "/quit", "/disconnect":
-							return m, func() tea.Msg { return p2pDisconnectMsg{Err: fmt.Errorf("session closed by user")} }
-
-						case "/status":
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      "=== AEGIS SECURE CORE DIAGNOSTICS ===",
-							})
-							if m.p2pNode != nil && m.p2pNode.Ratchet != nil {
-								r := m.p2pNode.Ratchet
-								m.chatHistory = append(m.chatHistory, chatMessage{
-									Sender:    "SYSTEM",
-									Timestamp: time.Now(),
-									Text:      fmt.Sprintf("• PeerID: %s", m.p2pNode.Host.ID().String()),
-								})
-								m.chatHistory = append(m.chatHistory, chatMessage{
-									Sender:    "SYSTEM",
-									Timestamp: time.Now(),
-									Text:      fmt.Sprintf("• Connection: %s (Latency: %d ms)", m.connectionType, m.rtt.Milliseconds()),
-								})
-								m.chatHistory = append(m.chatHistory, chatMessage{
-									Sender:    "SYSTEM",
-									Timestamp: time.Now(),
-									Text:      fmt.Sprintf("• Double Ratchet send seq: %d, recv seq: %d", r.SendMsgNum, r.RecvMsgNum),
-								})
-								m.chatHistory = append(m.chatHistory, chatMessage{
-									Sender:    "SYSTEM",
-									Timestamp: time.Now(),
-									Text:      fmt.Sprintf("• Ephemeral Identity FP: %s", crypto.Fingerprint(m.p2pNode.Identity.PublicKey)),
-								})
-							} else {
-								m.chatHistory = append(m.chatHistory, chatMessage{
-									Sender:    "SYSTEM",
-									Timestamp: time.Now(),
-									Text:      "• Secure Core not initialized.",
-								})
-							}
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      "=====================================",
-							})
-							m.updateViewportContent()
-							return m, nil
-
-						case "/help":
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      "=== AVAILABLE SLASH COMMANDS ===",
-							})
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      "• /clear - Clears local screen history from memory",
-							})
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      "• /status - Displays secure core diagnostics report",
-							})
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      "• /quit /disconnect - Securely disconnects session",
-							})
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      "• /help - Shows this help menu",
-							})
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      "================================",
-							})
-							m.updateViewportContent()
-							return m, nil
-						}
-					}
-
-					// 2. Check if the value is a local file path (e.g. pasted or drag-and-dropped)
-					filePath := val
-					if len(filePath) >= 2 {
-						if (filePath[0] == '"' && filePath[len(filePath)-1] == '"') || (filePath[0] == '\'' && filePath[len(filePath)-1] == '\'') {
-							filePath = filePath[1 : len(filePath)-1]
-						}
-					}
-					filePath = strings.TrimSpace(filePath)
-
-					if fi, err := os.Stat(filePath); err == nil {
-						if fi.IsDir() {
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      fmt.Sprintf("✗ Failed to send: '%s' is a directory. Only file transfers are supported.", filePath),
-							})
-							m.updateViewportContent()
-							return m, nil
-						}
-
-						if fi.Size() == 0 {
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      "✗ Failed to send: empty files not supported",
-							})
-							m.updateViewportContent()
-							return m, nil
-						}
-						if fi.Size() > MaxFileTransferSize {
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      fmt.Sprintf("✗ Failed to send: file too large (%d MB max)", MaxFileTransferSize/(1024*1024)),
-							})
-							m.updateViewportContent()
-							return m, nil
-						}
-
-						// Automatically switch to sender mode and initiate file offer!
-						m.filePath = filePath
-						m.fileName = filepath.Base(filePath)
-						m.fileSize = fi.Size()
-						const ChunkSize = 256 * 1024
-						m.totalChunks = int((m.fileSize + ChunkSize - 1) / ChunkSize)
-
-						hash, err := transfer.HashFile(filePath)
-						if err != nil {
-							m.sendState = SenderError
-							m.transferErr = err.Error()
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      fmt.Sprintf("✗ Failed to hash file: %v", err),
-							})
-							m.updateViewportContent()
-							return m, nil
-						}
-						m.fileHash = hash
-
-						offerFrame := transfer.AegisFrame{
-							Type:   transfer.TypeFileOffer,
-							Name:   m.fileName,
-							Size:   m.fileSize,
-							Chunks: m.totalChunks,
-							SHA256: m.fileHash,
-						}
-
-						if err := sendFrame(m.p2pNode, offerFrame); err != nil {
-							m.sendState = SenderError
-							m.transferErr = err.Error()
-							m.chatHistory = append(m.chatHistory, chatMessage{
-								Sender:    "SYSTEM",
-								Timestamp: time.Now(),
-								Text:      fmt.Sprintf("✗ Failed to send file offer: %v", err),
-							})
-							m.updateViewportContent()
-							return m, nil
-						}
-
-						m.sendState = SenderWaitAccept
-						m.currChunk = 0
-						m.chatHistory = append(m.chatHistory, chatMessage{
-							Sender:    "SYSTEM",
-							Timestamp: time.Now(),
-							Text:      fmt.Sprintf("📤 Initiating secure transfer for: %s", filePath),
-						})
-						m.updateViewportContent()
-						return m, nil
-					}
-
-					if m.p2pNode == nil || m.p2pNode.Ratchet == nil {
-						m.chatHistory = append(m.chatHistory, chatMessage{
-							Sender:    "SYSTEM",
-							Timestamp: time.Now(),
-							Text:      "Failed to send: no active secure connection",
-						})
-						m.updateViewportContent()
-						return m, nil
-					}
-
-					msgID := m.p2pNode.Ratchet.SendMsgNum
-					frame := transfer.AegisFrame{
-						Type:    transfer.TypeMsg,
-						MsgText: val,
-						Index:   int(msgID),
-					}
-					err := sendFrame(m.p2pNode, frame)
-					if err != nil {
-						m.chatHistory = append(m.chatHistory, chatMessage{
-							Sender:    "SYSTEM",
-							Timestamp: time.Now(),
-							Text:      "Failed to send: " + err.Error(),
-						})
-					} else {
-						m.chatHistory = append(m.chatHistory, chatMessage{
-							ID:        msgID,
-							Sender:    "YOU",
-							Timestamp: time.Now(),
-							Text:      val,
-							Status:    StatusSent,
-						})
-					}
-					m.updateViewportContent()
-				}
-				return m, nil
-			}
 		}
-
-	case p2pMessageReceivedMsg:
-		m.chatHistory = append(m.chatHistory, chatMessage{
-			ID:        msg.Index,
-			Sender:    "PEER",
-			Timestamp: time.Now(),
-			Text:      msg.Text,
-		})
-		m.updateViewportContent()
-
-		// Automatically reply with TypeMsgDelivered
-		deliveredFrame := transfer.AegisFrame{
-			Type:  transfer.TypeMsgDelivered,
-			Index: int(msg.Index),
+		if v.MessageID >= 0 {
+			for i := range m.history {
+				if m.history[i].Sender == "YOU" && m.history[i].ID == v.MessageID && m.history[i].Status == "pending" {
+					m.history[i].Status = "sent"
+				}
+			}
+			m.refresh()
 		}
-		_ = sendFrame(m.p2pNode, deliveredFrame)
-
-		// Automatically reply with TypeMsgRead (active chat session)
-		readFrame := transfer.AegisFrame{
-			Type:  transfer.TypeMsgRead,
-			Index: int(msg.Index),
-		}
-		_ = sendFrame(m.p2pNode, readFrame)
-
-		return m, listenForMessages(m.p2pNode)
-
-	case p2pChunkSentSuccessMsg:
-		// Wait for recipient TypeChunkAck to maintain standard window-size 1 transfer
 		return m, nil
-
-	case p2pChunkSendErrorMsg:
-		m.sendState = SenderError
-		m.transferErr = msg.Err.Error()
+	case chunkResult:
+		if v.Err != nil && m.engine.Snapshot().Busy && m.engine.Snapshot().ID == v.TransferID {
+			frame := m.engine.Cancel()
+			m.addSystem("File transfer failed: " + v.Err.Error())
+			return m, m.send(frame, -1)
+		}
 		return m, nil
-
-	case p2pFileFrameMsg:
-		frame := msg.Frame
-		switch frame.Type {
-		case transfer.TypeTyping:
-			m.peerTyping = true
-			m.lastTypingTime = time.Now()
-			return m, tea.Batch(
-				listenForMessages(m.p2pNode),
-				triggerClearTypingCmd(m.lastTypingTime),
-			)
-
+	case packetMsg:
+		f := v.Frame
+		defer crypto.Bytes(f.Data)
+		switch f.Type {
+		case transfer.TypeMsg:
+			m.add("PEER", f.MsgText, "", f.Index)
+			return m, m.send(transfer.AegisFrame{Type: transfer.TypeMsgDelivered, Index: f.Index}, -1)
 		case transfer.TypeMsgDelivered:
-			for i := len(m.chatHistory) - 1; i >= 0; i-- {
-				if m.chatHistory[i].Sender == "YOU" && m.chatHistory[i].ID == uint64(frame.Index) {
-					if m.chatHistory[i].Status < StatusDelivered {
-						m.chatHistory[i].Status = StatusDelivered
-						m.updateViewportContent()
-					}
-					break
+			for i := range m.history {
+				if m.history[i].Sender == "YOU" && m.history[i].ID == f.Index {
+					m.history[i].Status = "received"
 				}
 			}
-			return m, listenForMessages(m.p2pNode)
-
-		case transfer.TypeMsgRead:
-			for i := len(m.chatHistory) - 1; i >= 0; i-- {
-				if m.chatHistory[i].Sender == "YOU" && m.chatHistory[i].ID == uint64(frame.Index) {
-					if m.chatHistory[i].Status < StatusRead {
-						m.chatHistory[i].Status = StatusRead
-						m.updateViewportContent()
-					}
-					break
-				}
-			}
-			return m, listenForMessages(m.p2pNode)
-
+			m.refresh()
+			return m, nil
+		case transfer.TypeTyping:
+			m.peerTypingUntil = time.Now().Add(3 * time.Second)
+			return m, nil
 		case transfer.TypePing:
-			pongFrame := transfer.AegisFrame{
-				Type: transfer.TypePong,
-				Size: frame.Size,
-			}
-			_ = sendFrame(m.p2pNode, pongFrame)
-			return m, listenForMessages(m.p2pNode)
-
+			return m, m.send(transfer.AegisFrame{Type: transfer.TypePong, Size: f.Size}, -1)
 		case transfer.TypePong:
-			now := time.Now().UnixNano()
-			elapsed := time.Duration(now - frame.Size)
-			m.rtt = elapsed
-			return m, listenForMessages(m.p2pNode)
-
-		case transfer.TypeFileOffer:
-			LogDebug("Receiver received TypeFileOffer: name=%s, size=%d, chunks=%d, hash=%s", frame.Name, frame.Size, frame.Chunks, frame.SHA256)
-			if m.recvState == ReceiverIdle {
-				// Sanitize incoming file name to prevent path traversal cross-platform
-				sanitized := strings.ReplaceAll(frame.Name, "\\", "/")
-				safeName := filepath.Base(sanitized)
-				if safeName == "." || safeName == ".." || safeName == "" || strings.Contains(safeName, "/") || strings.Contains(safeName, "\\") {
-					LogDebug("Receiver: rejected malicious file name: %s", frame.Name)
-					return m, listenForMessages(m.p2pNode)
-				}
-
-				// Enforce maximum file size to prevent memory exhaustion
-				if frame.Size <= 0 || frame.Size > MaxFileTransferSize {
-					LogDebug("Receiver: rejected invalid or oversized file: size=%d", frame.Size)
-					rejectFrame := transfer.AegisFrame{
-						Type: transfer.TypeFileReject,
-					}
-					_ = sendFrame(m.p2pNode, rejectFrame)
-					return m, listenForMessages(m.p2pNode)
-				}
-
-				m.recvState = ReceiverOfferReceived
-				m.fileName = safeName
-				m.fileSize = frame.Size
-				m.totalChunks = frame.Chunks
-				m.fileHash = frame.SHA256
-				m.currChunk = 0
-				m.recvFileBytes = nil
-				m.input.Blur() // Temporarily unfocus text entry for acceptance keys
-				LogDebug("Receiver: state set to ReceiverOfferReceived, prompt displayed.")
-				m.chatHistory = append(m.chatHistory, chatMessage{
-					Sender:    "SYSTEM",
-					Timestamp: time.Now(),
-					Text:      fmt.Sprintf("📥 Incoming file offer: '%s' (%d bytes). Accept with Y / Reject with N.", safeName, frame.Size),
-				})
-				m.updateViewportContent()
-			} else {
-				LogDebug("Receiver: ignored TypeFileOffer because state is not ReceiverIdle (state=%v)", m.recvState)
+			if f.Size == m.lastPing {
+				m.rtt = time.Duration(time.Now().UnixNano() - f.Size)
 			}
-			return m, listenForMessages(m.p2pNode)
-
-		case transfer.TypeFileAccept:
-			LogDebug("Sender received TypeFileAccept. Current state=%v", m.sendState)
-			if m.sendState == SenderWaitAccept {
-				m.sendState = SenderSending
-				m.currChunk = 0
-				LogDebug("Sender starting transfer of %s...", m.fileName)
-				m.chatHistory = append(m.chatHistory, chatMessage{
-					Sender:    "SYSTEM",
-					Timestamp: time.Now(),
-					Text:      fmt.Sprintf("✓ Peer accepted file offer. Sending '%s'...", m.fileName),
-				})
-				m.updateViewportContent()
-				return m, tea.Batch(
-					listenForMessages(m.p2pNode),
-					sendNextChunkCmd(m.p2pNode, m.filePath, 0, m.fileName),
-				)
+			return m, nil
+		default:
+			before := m.engine.Snapshot()
+			responses, next, err := m.engine.Handle(f)
+			after := m.engine.Snapshot()
+			cmds := []tea.Cmd{}
+			for _, response := range responses {
+				cmds = append(cmds, m.send(response, -1))
 			}
-			return m, listenForMessages(m.p2pNode)
-
-		case transfer.TypeFileReject:
-			if m.sendState == SenderWaitAccept {
-				m.sendState = SenderRejected
-				m.chatHistory = append(m.chatHistory, chatMessage{
-					Sender:    "SYSTEM",
-					Timestamp: time.Now(),
-					Text:      fmt.Sprintf("✗ Peer rejected file offer for '%s'.", m.fileName),
-				})
-				m.updateViewportContent()
-			}
-			return m, listenForMessages(m.p2pNode)
-
-		case transfer.TypeChunk:
-			LogDebug("Receiver received TypeChunk: index=%d, size=%d, current expected index=%d, state=%v", frame.Index, len(frame.Data), m.currChunk, m.recvState)
-			if m.recvState == ReceiverReceiving {
-				if frame.Index == m.currChunk {
-					// Verify cumulative received size doesn't exceed declared file size
-					if int64(len(m.recvFileBytes))+int64(len(frame.Data)) > m.fileSize {
-						LogDebug("Receiver: error, received data size exceeds declared size")
-						m.recvState = ReceiverError
-						m.transferErr = "received data exceeds declared file size"
-						m.chatHistory = append(m.chatHistory, chatMessage{
-							Sender:    "SYSTEM",
-							Timestamp: time.Now(),
-							Text:      "✗ Received data exceeds declared file size.",
-						})
-						m.updateViewportContent()
-						crypto.Bytes(m.recvFileBytes)
-						m.recvFileBytes = nil
-						return m, listenForMessages(m.p2pNode)
-					}
-
-					m.recvFileBytes = append(m.recvFileBytes, frame.Data...)
-					crypto.Bytes(frame.Data)
-					m.currChunk++
-
-					LogDebug("Receiver: appending chunk %d. Sending TypeChunkAck...", frame.Index)
-					ackFrame := transfer.AegisFrame{
-						Type:  transfer.TypeChunkAck,
-						Index: frame.Index,
-					}
-					if err := sendFrame(m.p2pNode, ackFrame); err != nil {
-						LogDebug("Receiver: failed to send TypeChunkAck: %v", err)
-					}
-				} else {
-					LogDebug("Receiver: ignored out-of-order chunk %d (expected %d)", frame.Index, m.currChunk)
-				}
-			} else {
-				LogDebug("Receiver: ignored TypeChunk because state is not ReceiverReceiving")
-			}
-			return m, listenForMessages(m.p2pNode)
-
-		case transfer.TypeChunkAck:
-			LogDebug("Sender received TypeChunkAck: index=%d, state=%v", frame.Index, m.sendState)
-			if m.sendState == SenderSending {
-				if frame.Index == m.currChunk {
-					m.currChunk++
-					if m.currChunk >= m.totalChunks {
-						LogDebug("Sender: all chunks acknowledged. Sending TypeFileDone...")
-						// Send completion packet
-						doneFrame := transfer.AegisFrame{
-							Type:   transfer.TypeFileDone,
-							SHA256: m.fileHash,
-						}
-						_ = sendFrame(m.p2pNode, doneFrame)
-						m.sendState = SenderDone
-						m.chatHistory = append(m.chatHistory, chatMessage{
-							Sender:    "SYSTEM",
-							Timestamp: time.Now(),
-							Text:      fmt.Sprintf("✓ File '%s' sent successfully to peer.", m.fileName),
-						})
-						m.updateViewportContent()
-					} else {
-						LogDebug("Sender: sending chunk %d...", m.currChunk)
-						// Send next chunk immediately
-						return m, tea.Batch(
-							listenForMessages(m.p2pNode),
-							sendNextChunkCmd(m.p2pNode, m.filePath, m.currChunk, m.fileName),
-						)
-					}
-				} else {
-					LogDebug("Sender: ignored out-of-order TypeChunkAck %d (expected %d)", frame.Index, m.currChunk)
+			if err != nil {
+				m.addSystem(err.Error())
+				if len(responses) == 0 && after.Busy {
+					cmds = append(cmds, m.send(m.engine.Cancel(), -1))
 				}
 			}
-			return m, listenForMessages(m.p2pNode)
-
-		case transfer.TypeFileDone:
-			LogDebug("Receiver received TypeFileDone. Verifying SHA-256 hash...")
-			if m.recvState == ReceiverReceiving {
-				hash := sha256.Sum256(m.recvFileBytes)
-				hashStr := hex.EncodeToString(hash[:])
-				if hashStr == m.fileHash {
-					LogDebug("Receiver: hash verification succeeded. Prompting user to save...")
-					m.recvState = ReceiverSavePrompt
-					m.chatHistory = append(m.chatHistory, chatMessage{
-						Sender:    "SYSTEM",
-						Timestamp: time.Now(),
-						Text:      fmt.Sprintf("✓ File '%s' received and integrity verified. Press Ctrl+S to save it.", m.fileName),
-					})
-					m.updateViewportContent()
-				} else {
-					LogDebug("Receiver: hash verification failed! Expected: %s, Got: %s", m.fileHash, hashStr)
-					m.recvState = ReceiverError
-					m.transferErr = fmt.Sprintf("SHA-256 mismatch!\nExpected: %s\nGot: %s", m.fileHash, hashStr)
-					m.chatHistory = append(m.chatHistory, chatMessage{
-						Sender:    "SYSTEM",
-						Timestamp: time.Now(),
-						Text:      fmt.Sprintf("✗ File '%s' transfer failed: SHA-256 integrity check mismatch.", m.fileName),
-					})
-					m.updateViewportContent()
-					crypto.Bytes(m.recvFileBytes)
-					m.recvFileBytes = nil
-				}
-			} else {
-				LogDebug("Receiver: ignored TypeFileDone because state is not ReceiverReceiving")
+			if before.State != after.State {
+				m.addSystem("File: " + after.State + " — " + after.Name)
 			}
-			return m, listenForMessages(m.p2pNode)
+			if next {
+				cmds = append(cmds, m.chunk())
+			}
+			return m, tea.Batch(cmds...)
+		}
+	case tea.KeyMsg:
+		if m.saving {
+			return m, nil
+		}
+		if m.overwritePrompt {
+			switch strings.ToLower(v.String()) {
+			case "y":
+				return m, m.save(true)
+			case "n", "esc":
+				m.overwritePrompt = false
+				m.saveMode = false
+				if m.finishAfterSave {
+					m.closePrompt = true
+				}
+				m.normalInput()
+			}
+			return m, nil
+		}
+		if m.closePrompt {
+			switch strings.ToLower(v.String()) {
+			case "s":
+				m.closePrompt = false
+				m.finishAfterSave = true
+				m.beginSave()
+			case "d":
+				m.engine.Close()
+				return m, func() tea.Msg { return closeConfirmedMsg{} }
+			}
+			return m, nil
+		}
+		if m.engine.Snapshot().Offer && !m.pickerMode && !m.saveMode && !m.fileMode {
+			switch strings.ToLower(v.String()) {
+			case "y", "n":
+				frame, err := m.engine.Accept(strings.ToLower(v.String()) == "y")
+				if err != nil {
+					m.addSystem(err.Error())
+					return m, nil
+				}
+				return m, m.send(frame, -1)
+			}
+		}
+		if !m.pickerMode {
+			switch v.String() {
+			case "ctrl+f":
+				if !m.engine.Snapshot().Busy && !m.preparing {
+					m.pickerMode = true
+					m.filepicker = filepicker.New()
+					m.filepicker.CurrentDirectory, _ = os.Getwd()
+					return m, m.filepicker.Init()
+				}
+				return m, nil
+			case "ctrl+o":
+				if !m.engine.Snapshot().Busy && !m.preparing {
+					m.fileMode = true
+					m.input.CharLimit = 4096
+					m.input.SetValue("")
+					m.input.Placeholder = "file path..."
+				}
+				return m, nil
+			case "ctrl+s":
+				if m.engine.Snapshot().Unsaved {
+					m.beginSave()
+				}
+				return m, nil
+			case "ctrl+x":
+				m.prepareGeneration++
+				m.preparing = false
+				if m.engine.Snapshot().Busy {
+					return m, m.send(m.engine.Cancel(), -1)
+				}
+				return m, nil
+			case "f2":
+				m.showDetails = !m.showDetails
+				return m, nil
+			case "esc":
+				if m.fileMode || m.saveMode {
+					m.normalInput()
+					if m.finishAfterSave {
+						m.closePrompt = true
+					}
+					return m, nil
+				}
+				return m, func() tea.Msg { return closeRequestMsg{} }
+			case "pgup", "pgdown", "up", "down":
+				var cmd tea.Cmd
+				m.viewport, cmd = m.viewport.Update(v)
+				return m, cmd
+			case "enter":
+				value := strings.TrimSpace(m.input.Value())
+				if value == "" {
+					return m, nil
+				}
+				if m.fileMode {
+					m.normalInput()
+					return m, m.prepare(strings.Trim(value, "\"'"))
+				}
+				if m.saveMode {
+					m.savePath = value
+					return m, m.save(false)
+				}
+				m.input.SetValue("")
+				switch value {
+				case "/quit":
+					return m, func() tea.Msg { return closeRequestMsg{Quit: true} }
+				case "/disconnect":
+					return m, func() tea.Msg { return closeRequestMsg{} }
+				case "/clear":
+					m.history = nil
+					m.viewport.SetContent("")
+					return m, nil
+				case "/help":
+					m.addSystem("Ctrl+F browse, Ctrl+O file path, Ctrl+S save, Ctrl+X cancel transfer, F2 fingerprints, Esc disconnect.")
+					return m, nil
+				case "/status":
+					m.addSystem("Encrypted connection via " + m.session.ConnectionType() + ". Peer: " + m.session.PeerID())
+					return m, nil
+				}
+				candidate := strings.Trim(value, "\"'")
+				if filepath.IsAbs(candidate) || (len(candidate) > 2 && candidate[1] == ':' && (candidate[2] == '\\' || candidate[2] == '/')) {
+					return m, m.prepare(candidate)
+				}
+				id := m.nextMessageID
+				m.nextMessageID++
+				m.add("YOU", value, "pending", id)
+				return m, m.send(transfer.AegisFrame{Type: transfer.TypeMsg, MsgText: value, Index: id}, id)
+			}
+			if !m.fileMode && !m.saveMode && v.Type == tea.KeyRunes && time.Since(m.lastTyping) > 2*time.Second {
+				m.lastTyping = time.Now()
+				var cmd tea.Cmd
+				m.input, cmd = m.input.Update(v)
+				return m, tea.Batch(cmd, m.send(transfer.AegisFrame{Type: transfer.TypeTyping}, -1))
+			}
 		}
 	}
-
-	if m.input.Focused() {
-		var ic tea.Cmd
-		m.input, ic = m.input.Update(msg)
-		cmds = append(cmds, ic)
+	if m.pickerMode {
+		if key, ok := msg.(tea.KeyMsg); ok && key.String() == "esc" {
+			m.pickerMode = false
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.filepicker, cmd = m.filepicker.Update(msg)
+		if selected, path := m.filepicker.DidSelectFile(msg); selected {
+			m.pickerMode = false
+			return m, m.prepare(path)
+		}
+		return m, cmd
 	}
-
-	return m, tea.Batch(cmds...)
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
 }
-
-// ── View Rendering ───────────────────────────────────────────────────────────
-
 func (m ChatModel) View() string {
-	if m.width == 0 {
-		return ""
+	header := "AEGIS — ENCRYPTED TEMPORARY SESSION"
+	if m.session.PeerName != "" {
+		header += " · " + m.session.PeerName
 	}
-
-	sidebarW := 34
-	chatW := m.width - sidebarW - 1
-	if chatW < 20 {
-		chatW = 20
+	if time.Now().Before(m.peerTypingUntil) {
+		header += " · peer typing"
 	}
-	chatHeight := m.height - 8
-	if chatHeight < 5 {
-		chatHeight = 5
+	transferStatus := m.engine.Snapshot()
+	status := fmt.Sprintf("%s · %d ms", m.session.ConnectionType(), m.rtt.Milliseconds())
+	if transferStatus.State != "" {
+		status += " | File: " + transferStatus.State + fmt.Sprintf(" (%d/%d)", transferStatus.Current, transferStatus.Total)
 	}
-
-	// 1. Build Left Chat Box
-	var leftBox string
+	content := m.viewport.View()
 	if m.pickerMode {
-		leftBox = PanelStyle.Width(chatW).Height(chatHeight).Render(m.filepicker.View())
-	} else {
-		leftBox = PanelStyle.Width(chatW).Height(chatHeight).Render(m.viewport.View())
+		content = m.filepicker.View()
 	}
-
-	// 2. Build Right Sidebar lines
-	var sidebarLines []string
-	sidebarLines = append(sidebarLines, PrimaryBold.Render("  AEGIS SECURE CORE"))
-	sidebarLines = append(sidebarLines, HR(sidebarW-4))
-
-	if m.p2pNode != nil && m.p2pNode.Ratchet != nil {
-		r := m.p2pNode.Ratchet
-		sidebarLines = append(sidebarLines, fmt.Sprintf(" %s %s", LabelStyle.Render("SEND NUM"), ValueStyle.Render(fmt.Sprintf("%d", r.SendMsgNum))))
-		sidebarLines = append(sidebarLines, fmt.Sprintf(" %s %s", LabelStyle.Render("RECV NUM"), ValueStyle.Render(fmt.Sprintf("%d", r.RecvMsgNum))))
-	} else {
-		sidebarLines = append(sidebarLines, "  ratchet not initialized")
+	lines := []string{PrimaryBold.Render(header), MutedText.Render(status), PanelStyle.Width(max(10, m.width-4)).Render(content)}
+	if m.preparing {
+		lines = append(lines, "Preparing file...")
 	}
-
-	// Dynamic network diagnostics
-	sidebarLines = append(sidebarLines, "")
-	sidebarLines = append(sidebarLines, PrimaryBold.Render("  NET DIAGNOSTICS"))
-	sidebarLines = append(sidebarLines, HR(sidebarW-4))
-
-	var rttStr string
-	if m.rtt == 0 {
-		rttStr = "measuring..."
-	} else {
-		rttStr = fmt.Sprintf("%d ms", m.rtt.Milliseconds())
+	if transferStatus.Offer {
+		lines = append(lines, WarningBold.Render("Incoming file: "+transferStatus.Name+" — [Y] Accept [N] Reject"))
 	}
-
-	connType := m.connectionType
-	if connType == "" {
-		connType = "Direct"
+	if transferStatus.Unsaved {
+		lines = append(lines, WarningBold.Render("File is in memory and has NOT been saved. Ctrl+S to save."))
 	}
-
-	var connTypeStyled string
-	if connType == "Relay" {
-		connTypeStyled = WarningBold.Render("RELAYED")
-	} else {
-		connTypeStyled = PrimaryBold.Render("DIRECT")
+	if m.showDetails {
+		lines = append(lines, "Local: "+m.session.LocalFP, "Remote: "+m.session.RemoteFP, "Comparison words: "+m.session.SAS, "Independent comparison is optional. Names do not prove personal identity.")
 	}
-
-	sidebarLines = append(sidebarLines, fmt.Sprintf(" %s %s", LabelStyle.Render("LATENCY"), ValueStyle.Render(rttStr)))
-	sidebarLines = append(sidebarLines, fmt.Sprintf(" %s %s", LabelStyle.Render("CHANNEL"), connTypeStyled))
-
-	sidebarLines = append(sidebarLines, "")
-	sidebarLines = append(sidebarLines, PrimaryBold.Render("  FILE TRANSFER"))
-	sidebarLines = append(sidebarLines, HR(sidebarW-4))
-
-	if m.sendState != SenderIdle {
-		sidebarLines = append(sidebarLines, " "+SecondaryText.Render("OUTGOING TRANSFER"))
-		sidebarLines = append(sidebarLines, fmt.Sprintf("  %s", shorten(m.fileName, 20)))
-		sidebarLines = append(sidebarLines, fmt.Sprintf("  Size: %d bytes", m.fileSize))
-
-		switch m.sendState {
-		case SenderWaitAccept:
-			sidebarLines = append(sidebarLines, "  "+WarningBold.Render("WAITING FOR PEER..."))
-		case SenderSending:
-			sidebarLines = append(sidebarLines, "  "+PrimaryBold.Render("SENDING CHUNKS"))
-			sidebarLines = append(sidebarLines, "  "+ScanBar(m.currChunk, m.totalChunks, sidebarW-12))
-		case SenderDone:
-			sidebarLines = append(sidebarLines, "  "+PrimaryText.Render("✓ TRANSFER COMPLETE"))
-		case SenderRejected:
-			sidebarLines = append(sidebarLines, "  "+WarningBold.Render("✗ PEER REJECTED OFFER"))
-		case SenderError:
-			sidebarLines = append(sidebarLines, "  "+WarningBold.Render("✗ ERROR:"))
-			sidebarLines = append(sidebarLines, "  "+WarningText.Render(shorten(m.transferErr, 25)))
+	if m.overwritePrompt {
+		lines = append(lines, WarningBold.Render("Destination exists. [Y] Overwrite [N] Keep existing file"))
+	} else if m.closePrompt {
+		text := "Unsaved file: [S] Save then close [D] Discard and close"
+		if !m.closeLost {
+			text += " [Esc] Stay"
 		}
-	} else if m.recvState != ReceiverIdle {
-		sidebarLines = append(sidebarLines, " "+SecondaryText.Render("INCOMING TRANSFER"))
-		sidebarLines = append(sidebarLines, fmt.Sprintf("  %s", shorten(m.fileName, 20)))
-		sidebarLines = append(sidebarLines, fmt.Sprintf("  Size: %d bytes", m.fileSize))
-
-		switch m.recvState {
-		case ReceiverOfferReceived:
-			sidebarLines = append(sidebarLines, "  "+WarningBold.Render("! FILE OFFER RECEIVED"))
-			sidebarLines = append(sidebarLines, "")
-			sidebarLines = append(sidebarLines, "  "+WarningBold.Render("ACCEPT? [Y/N]"))
-		case ReceiverReceiving:
-			sidebarLines = append(sidebarLines, "  "+PrimaryBold.Render("RECEIVING CHUNKS"))
-			sidebarLines = append(sidebarLines, "  "+ScanBar(m.currChunk, m.totalChunks, sidebarW-12))
-		case ReceiverSavePrompt:
-			sidebarLines = append(sidebarLines, "  "+PrimaryText.Render("✓ INTEGRITY VERIFIED"))
-			sidebarLines = append(sidebarLines, "  "+WarningBold.Render("PRESS CTRL+S TO SAVE"))
-		case ReceiverSaving:
-			sidebarLines = append(sidebarLines, "  "+SecondaryText.Render("SAVING TO DISK..."))
-		case ReceiverDone:
-			sidebarLines = append(sidebarLines, "  "+PrimaryText.Render("✓ FILE SAVED SECURELY"))
-			sidebarLines = append(sidebarLines, "")
-			sidebarLines = append(sidebarLines, "  Location:")
-			sidebarLines = append(sidebarLines, "  "+SubtleText.Render(shorten(m.savePath, 28)))
-		case ReceiverError:
-			sidebarLines = append(sidebarLines, "  "+WarningBold.Render("✗ ERROR:"))
-			sidebarLines = append(sidebarLines, "  "+WarningText.Render(shorten(m.transferErr, 25)))
-		}
+		lines = append(lines, WarningBold.Render(text))
 	} else {
-		sidebarLines = append(sidebarLines, "  No active transfers.")
-		sidebarLines = append(sidebarLines, "")
-		sidebarLines = append(sidebarLines, "  "+KeyHelp("Ctrl+F", "Send File"))
+		lines = append(lines, m.input.View())
 	}
-
-	for len(sidebarLines) < chatHeight {
-		sidebarLines = append(sidebarLines, "")
-	}
-	if len(sidebarLines) > chatHeight {
-		sidebarLines = sidebarLines[:chatHeight]
-	}
-	sidebarContent := strings.Join(sidebarLines, "\n")
-
-	// Render rounded side-by-side boxes
-	rightBox := DimPanelStyle.Width(sidebarW).Height(chatHeight).Render(sidebarContent)
-	mainRow := lipgloss.JoinHorizontal(lipgloss.Top, leftBox, rightBox)
-
-	// 3. Render Header
-	headerStyle := lipgloss.NewStyle().
-		Background(ColorPrimary).
-		Foreground(lipgloss.Color("#000000")).
-		Bold(true).
-		Width(m.width).
-		Align(lipgloss.Center)
-
-	headerText := "AEGIS // SECURE ZERO-TRUST CHAT"
-	if m.peerTyping {
-		headerText = "AEGIS // SECURE ZERO-TRUST CHAT  [ PEER yazıyor... ]"
-	}
-	header := headerStyle.Render(headerText)
-
-	// 4. Text Input field
-	inputField := m.input.View()
-
-	// Keyboard shortcut legend line
-	var legend string
-	if m.pickerMode {
-		legend = "  " + KeyHelp("ENTER", "Select") + "   " + KeyHelp("↑/↓", "Navigate") + "   " + KeyHelp("← / h", "Parent Dir") + "   " + KeyHelp("→ / l", "Open Dir") + "   " + KeyHelp("ESC", "Cancel")
-	} else if m.fileMode {
-		legend = "  " + KeyHelp("ENTER", "Confirm Send Path") + "   " + KeyHelp("ESC", "Cancel")
-	} else if m.saveMode {
-		legend = "  " + KeyHelp("ENTER", "Confirm Save Path") + "   " + KeyHelp("ESC", "Cancel")
-	} else if m.recvState == ReceiverOfferReceived {
-		legend = "  " + KeyHelp("Y", "Accept File Offer") + "   " + KeyHelp("N", "Reject Offer")
-	} else {
-		legend = "  " + KeyHelp("ENTER", "Send Msg") + "   " + KeyHelp("Ctrl+F", "Browse File") + "   " + KeyHelp("Ctrl+O", "Enter Path") + "   " + KeyHelp("Ctrl+C", "Disconnect")
-	}
-
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		"",
-		mainRow,
-		"",
-		"  "+inputField,
-		"",
-		legend,
-	)
+	lines = append(lines, KeyHelp("Ctrl+F", "File")+"  "+KeyHelp("Ctrl+S", "Save")+"  "+KeyHelp("Ctrl+X", "Cancel transfer")+"  "+KeyHelp("Esc", "Disconnect"))
+	return strings.Join(lines, "\n")
 }
-
-// Destroy cleans up the active file buffers in RAM securely.
 func (m *ChatModel) Destroy() {
-	if m.recvFileBytes != nil {
-		crypto.Bytes(m.recvFileBytes)
-		m.recvFileBytes = nil
+	if m.engine != nil {
+		m.engine.Close()
+	}
+	m.history = nil
+	m.input.SetValue("")
+	m.viewport.SetContent("")
+	m.prepareGeneration++
+}
+func disposeChatEvent(v any) {
+	if prepared, ok := v.(preparedFile); ok && prepared.Upload != nil {
+		prepared.Upload.Close()
 	}
 }

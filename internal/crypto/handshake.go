@@ -6,119 +6,98 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
-	"io"
-
 	"golang.org/x/crypto/hkdf"
+	"io"
 )
 
-// HandshakeResult encapsulates the derived session keys and identities.
 type HandshakeResult struct {
-	SharedRootKey [32]byte
-	LocalIdentity *Identity
-	RemotePubKey  ed25519.PublicKey
+	SharedRootKey  [32]byte
+	LocalIdentity  *Identity
+	RemotePubKey   ed25519.PublicKey
+	TranscriptHash [32]byte
 }
 
-// RunHandshake performs an ephemeral X25519 DH exchange and Ed25519 identity authentication
-// over the raw P2P network reader and writer.
-func RunHandshake(rw io.ReadWriter, localIdent *Identity, isInitiator bool) (*HandshakeResult, error) {
-	// 1. Generate ephemeral X25519 keypair
-	ephemPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+func RunHandshake(rw io.ReadWriter, id *Identity, initiator bool) (*HandshakeResult, error) {
+	return RunBoundHandshake(rw, id, initiator, nil)
+}
+
+// RunBoundHandshake authenticates ephemeral keys and binds them to the request
+// and transport peer identities. It does not authenticate a person's real name.
+func RunBoundHandshake(rw io.ReadWriter, id *Identity, initiator bool, context []byte) (*HandshakeResult, error) {
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate ephemeral X25519 key: %w", err)
+		return nil, err
 	}
-	localX509Pub := ephemPriv.PublicKey().Bytes()
-
-	// 2. Exchange ephemeral public keys
-	var remoteX509Pub []byte
-	if isInitiator {
-		// Initiator writes first
-		if _, err := rw.Write(localX509Pub); err != nil {
-			return nil, fmt.Errorf("initiator failed to write ephemeral pubkey: %w", err)
+	local := make([]byte, 64)
+	copy(local, priv.PublicKey().Bytes())
+	copy(local[32:], id.PublicKey)
+	remote := make([]byte, 64)
+	exchange := func(out, in []byte) error {
+		if initiator {
+			if err := writeFull(rw, out); err != nil {
+				return err
+			}
+			_, err := io.ReadFull(rw, in)
+			return err
 		}
-		remoteX509Pub = make([]byte, 32)
-		if _, err := io.ReadFull(rw, remoteX509Pub); err != nil {
-			return nil, fmt.Errorf("initiator failed to read ephemeral pubkey: %w", err)
+		if _, err := io.ReadFull(rw, in); err != nil {
+			return err
 		}
+		return writeFull(rw, out)
+	}
+	if err := exchange(local, remote); err != nil {
+		return nil, fmt.Errorf("exchange public keys: %w", err)
+	}
+	transcript := append([]byte("aegis-handshake-v2\x00"), context...)
+	if initiator {
+		transcript = append(transcript, local...)
+		transcript = append(transcript, remote...)
 	} else {
-		// Responder reads first
-		remoteX509Pub = make([]byte, 32)
-		if _, err := io.ReadFull(rw, remoteX509Pub); err != nil {
-			return nil, fmt.Errorf("responder failed to read ephemeral pubkey: %w", err)
-		}
-		if _, err := rw.Write(localX509Pub); err != nil {
-			return nil, fmt.Errorf("responder failed to write ephemeral pubkey: %w", err)
-		}
+		transcript = append(transcript, remote...)
+		transcript = append(transcript, local...)
 	}
-
-	// 3. Compute X25519 shared secret
-	remotePub, err := ecdh.X25519().NewPublicKey(remoteX509Pub)
+	digest := sha256.Sum256(transcript)
+	sig := ed25519.Sign(id.PrivateKey, digest[:])
+	defer Bytes(sig)
+	remoteSig := make([]byte, ed25519.SignatureSize)
+	if err := exchange(sig, remoteSig); err != nil {
+		return nil, fmt.Errorf("exchange signatures: %w", err)
+	}
+	pub := ed25519.PublicKey(append([]byte(nil), remote[32:]...))
+	if !ed25519.Verify(pub, digest[:], remoteSig) {
+		return nil, fmt.Errorf("invalid handshake signature")
+	}
+	remoteDH, err := ecdh.X25519().NewPublicKey(remote[:32])
 	if err != nil {
-		return nil, fmt.Errorf("invalid remote ephemeral pubkey: %w", err)
+		return nil, err
 	}
-	sharedSecret, err := ephemPriv.ECDH(remotePub)
+	secret, err := priv.ECDH(remoteDH)
 	if err != nil {
-		return nil, fmt.Errorf("X25519 key exchange failed: %w", err)
+		return nil, err
 	}
-	defer Bytes(sharedSecret)
-
-	// 4. Construct verification transcript to sign
-	// E.g. transcript = initiator_X25519 || responder_X25519
-	var transcript []byte
-	if isInitiator {
-		transcript = append(localX509Pub, remoteX509Pub...)
-	} else {
-		transcript = append(remoteX509Pub, localX509Pub...)
+	defer Bytes(secret)
+	var root [32]byte
+	if _, err := io.ReadFull(hkdf.New(sha256.New, secret, digest[:], []byte("aegis-root-v2")), root[:]); err != nil {
+		return nil, err
 	}
+	return &HandshakeResult{SharedRootKey: root, LocalIdentity: id, RemotePubKey: pub, TranscriptHash: digest}, nil
+}
 
-	// 5. Sign the transcript using our Ed25519 identity key
-	localSig := ed25519.Sign(localIdent.PrivateKey, transcript)
-	defer Bytes(localSig)
-
-	// 6. Pack identity verification payload: [32B Ed25519 public key][64B transcript signature]
-	localVerifyPayload := make([]byte, 32+64)
-	defer Bytes(localVerifyPayload)
-	copy(localVerifyPayload[:32], localIdent.PublicKey)
-	copy(localVerifyPayload[32:], localSig)
-
-	// 7. Exchange identity payload
-	var remoteVerifyPayload []byte
-	if isInitiator {
-		if _, err := rw.Write(localVerifyPayload); err != nil {
-			return nil, fmt.Errorf("failed to send local identity: %w", err)
+func writeFull(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if err != nil {
+			return err
 		}
-		remoteVerifyPayload = make([]byte, 32+64)
-		if _, err := io.ReadFull(rw, remoteVerifyPayload); err != nil {
-			return nil, fmt.Errorf("failed to receive remote identity: %w", err)
+		if n <= 0 || n > len(b) {
+			return io.ErrShortWrite
 		}
-	} else {
-		remoteVerifyPayload = make([]byte, 32+64)
-		if _, err := io.ReadFull(rw, remoteVerifyPayload); err != nil {
-			return nil, fmt.Errorf("failed to receive remote identity: %w", err)
-		}
-		if _, err := rw.Write(localVerifyPayload); err != nil {
-			return nil, fmt.Errorf("failed to send local identity: %w", err)
-		}
+		b = b[n:]
 	}
+	return nil
+}
 
-	remoteIdentPub := ed25519.PublicKey(remoteVerifyPayload[:32])
-	remoteSig := remoteVerifyPayload[32:]
-
-	// 8. Verify remote peer's signature against transcript
-	if !ed25519.Verify(remoteIdentPub, transcript, remoteSig) {
-		return nil, fmt.Errorf("man-in-the-middle detected: invalid remote identity signature")
-	}
-
-	// 9. Derive the shared root key using HKDF-SHA256
-	hkdfSalt := []byte("aegis-hkdf-salt-v1")
-	hkdfReader := hkdf.New(sha256.New, sharedSecret, hkdfSalt, []byte("aegis-root-v1"))
-	var rootKey [32]byte
-	if _, err := io.ReadFull(hkdfReader, rootKey[:]); err != nil {
-		return nil, fmt.Errorf("failed to derive root key using HKDF: %w", err)
-	}
-
-	return &HandshakeResult{
-		SharedRootKey: rootKey,
-		LocalIdentity: localIdent,
-		RemotePubKey:  remoteIdentPub,
-	}, nil
+// TranscriptSAS provides 48 bits for optional independent comparison.
+func TranscriptSAS(hash [32]byte) string {
+	return fmt.Sprintf("%s · %s · %s · %s · %s · %s", BIP39Words[hash[0]], BIP39Words[hash[1]], BIP39Words[hash[2]], BIP39Words[hash[3]], BIP39Words[hash[4]], BIP39Words[hash[5]])
 }

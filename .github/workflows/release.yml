@@ -1,0 +1,36 @@
+name: Release binaries
+on:
+  push:
+    tags: ['v2.*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        run: go test -race ./...
+      - name: Build and checksum
+        shell: bash
+        run: |
+          mkdir -p release
+          for platform in linux darwin windows; do
+            label="$platform"
+            if [ "$platform" = darwin ]; then label=macos; fi
+            for arch in amd64 arm64; do
+              suffix=''
+              if [ "$platform" = windows ]; then suffix=.exe; fi
+              CGO_ENABLED=0 GOOS="$platform" GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "release/aegis-$label-$arch$suffix" ./cmd/aegis
+            done
+          done
+          cd release
+          sha256sum aegis-* > SHA256SUMS
+      - name: Publish tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes

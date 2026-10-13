@@ -1,150 +1,54 @@
-#!/bin/bash
-
-# Aegis Installer for Linux & macOS
-# Automatically installs Go or downloads precompiled binaries if Go is missing.
-
-set -e
-
-# Change directory to the script's location
+#!/usr/bin/env bash
+# Build locally when possible; otherwise install a checksum-verified release.
+set -euo pipefail
 cd "$(dirname "$0")"
+aegis_os=$(uname -s)
+aegis_arch=$(uname -m)
+case "$aegis_os" in Linux) aegis_platform=linux;; Darwin) aegis_platform=macos;; *) echo 'Unsupported operating system.' >&2; exit 1;; esac
+case "$aegis_arch" in x86_64|amd64) aegis_arch=amd64;; aarch64|arm64) aegis_arch=arm64;; *) echo 'Unsupported architecture.' >&2; exit 1;; esac
+aegis_tmp=$(mktemp -d)
+trap 'rm -rf "$aegis_tmp"' EXIT
 
-echo "==================================================="
-echo "              🛡️ AEGIS INSTALLER 🛡️"
-echo "==================================================="
-
-# Detect OS
-OS_TYPE="$(uname -s)"
-ARCH_TYPE="$(uname -m)"
-
-# 1. Check if Go is installed
-if ! command -v go &> /dev/null; then
-    echo "[!] Go is not installed."
-    
-    # Try to install Go
-    if [ "$OS_TYPE" = "Darwin" ]; then
-        if command -v brew &> /dev/null; then
-            echo "[!] Attempting to install Go via Homebrew..."
-            brew install go
-        else
-            echo "[X] Homebrew not found. Cannot install Go automatically."
-        fi
-    elif [ "$OS_TYPE" = "Linux" ]; then
-        if command -v apt-get &> /dev/null; then
-            echo "[!] Attempting to install Go via apt-get..."
-            sudo apt-get update && sudo apt-get install -y golang
-        elif command -v dnf &> /dev/null; then
-            echo "[!] Attempting to install Go via dnf..."
-            sudo dnf install -y golang
-        elif command -v pacman &> /dev/null; then
-            echo "[!] Attempting to install Go via pacman..."
-            sudo pacman -S --noconfirm go
-        else
-            echo "[X] No recognized package manager (apt, dnf, pacman) found."
-        fi
+# Keep package-manager failures recoverable so the verified-release fallback runs.
+if ! command -v go >/dev/null 2>&1; then
+    echo 'Go is missing; trying the system package manager.'
+    if [ "$aegis_platform" = macos ] && command -v brew >/dev/null 2>&1; then
+        if ! brew install go; then echo 'Go installation failed; trying a release.' >&2; fi
+    elif command -v apt-get >/dev/null 2>&1; then
+        if ! (sudo apt-get update && sudo apt-get install -y golang); then echo 'Go installation failed; trying a release.' >&2; fi
+    elif command -v dnf >/dev/null 2>&1; then
+        if ! sudo dnf install -y golang; then echo 'Go installation failed; trying a release.' >&2; fi
+    elif command -v pacman >/dev/null 2>&1; then
+        if ! sudo pacman -S --noconfirm go; then echo 'Go installation failed; trying a release.' >&2; fi
     fi
 fi
 
-# 2. Check if Go is now available
-if command -v go &> /dev/null; then
-    echo "[!] Compiling Aegis from source with Go..."
-    go install ./cmd/aegis
-    
-    # Locate output binary
-    GOPATH_DIR=$(go env GOPATH)
-    if [ -z "$GOPATH_DIR" ]; then
-        GOPATH_DIR="$HOME/go"
-    fi
-    BIN_DIR="$GOPATH_DIR/bin"
-    
-    # Verify installation
-    if [ -f "$BIN_DIR/aegis" ]; then
-        chmod +x "$BIN_DIR/aegis"
-        # Check if BIN_DIR is in PATH, if not, append to bashrc/zshrc
-        if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-            echo "[!] Adding $BIN_DIR to PATH in shell profile..."
-            if [ -f "$HOME/.zshrc" ]; then
-                echo "export PATH=\$PATH:$BIN_DIR" >> "$HOME/.zshrc"
-                echo "[i] Added to ~/.zshrc. Please run 'source ~/.zshrc' or open a new terminal."
-            elif [ -f "$HOME/.bashrc" ]; then
-                echo "export PATH=\$PATH:$BIN_DIR" >> "$HOME/.bashrc"
-                echo "[i] Added to ~/.bashrc. Please run 'source ~/.bashrc' or open a new terminal."
-            else
-                echo "[i] Please add export PATH=\$PATH:$BIN_DIR to your shell profile."
-            fi
-        fi
-
-        echo "==================================================="
-        echo "[✔] AEGIS SUCCESSFULLY INSTALLED FROM SOURCE!"
-        echo "==================================================="
-        echo "[i] You can run Aegis by typing: aegis"
-        echo "[i] (You might need to restart your terminal or run: source ~/.bashrc or source ~/.zshrc)"
-        echo "==================================================="
-        exit 0
-    fi
+aegis_built=false
+if command -v go >/dev/null 2>&1; then
+    echo 'Building Aegis (Go 1.25.7 or newer required).'
+    if go build -trimpath -o "$aegis_tmp/aegis" ./cmd/aegis; then aegis_built=true; fi
+fi
+if [ "$aegis_built" = false ]; then
+    aegis_asset="aegis-${aegis_platform}-${aegis_arch}"
+    aegis_release='https://github.com/rifatardarslan/Aegis/releases/latest/download'
+    aegis_download() {
+        if command -v curl >/dev/null 2>&1; then curl --fail --location --show-error --silent "$1" -o "$2"
+        elif command -v wget >/dev/null 2>&1; then wget -q -O "$2" "$1"
+        else echo 'curl or wget is required.' >&2; return 1; fi
+    }
+    echo "Downloading $aegis_asset and SHA256SUMS."
+    aegis_download "$aegis_release/$aegis_asset" "$aegis_tmp/aegis"
+    aegis_download "$aegis_release/SHA256SUMS" "$aegis_tmp/SHA256SUMS"
+    aegis_expected=$(awk -v asset="$aegis_asset" '$2 == asset || $2 == "*"asset { print $1 }' "$aegis_tmp/SHA256SUMS")
+    if [[ ! "$aegis_expected" =~ ^[0-9a-fA-F]{64}$ ]]; then echo 'Missing or invalid release checksum.' >&2; exit 1; fi
+    if command -v sha256sum >/dev/null 2>&1; then aegis_actual=$(sha256sum "$aegis_tmp/aegis"); aegis_actual=${aegis_actual%% *}
+    elif command -v shasum >/dev/null 2>&1; then aegis_actual=$(shasum -a 256 "$aegis_tmp/aegis"); aegis_actual=${aegis_actual%% *}
+    else echo 'A SHA-256 utility is required.' >&2; exit 1; fi
+    if [ "$aegis_actual" != "$aegis_expected" ]; then echo 'Release checksum mismatch; nothing installed.' >&2; exit 1; fi
 fi
 
-# 3. Fallback: Download precompiled binary from GitHub Releases
-echo "[!] Go installation was not completed or build failed."
-echo "[!] Attempting to download the latest precompiled binary from GitHub..."
-
-REPO_URL="https://github.com/rifatardarslan/Aegis"
-BINARY_NAME="aegis"
-
-if [ "$OS_TYPE" = "Darwin" ]; then
-    DOWNLOAD_URL="${REPO_URL}/releases/latest/download/aegis-macos"
-elif [ "$OS_TYPE" = "Linux" ]; then
-    DOWNLOAD_URL="${REPO_URL}/releases/latest/download/aegis-linux"
-else
-    echo "[X] Unsupported OS type: $OS_TYPE"
-    exit 1
-fi
-
-# Download
-if command -v curl &> /dev/null; then
-    curl -L -o "$BINARY_NAME" "$DOWNLOAD_URL" || true
-elif command -v wget &> /dev/null; then
-    wget -O "$BINARY_NAME" "$DOWNLOAD_URL" || true
-fi
-
-# Verify local precompiled or downloaded binary exists
-if [ ! -f "$BINARY_NAME" ]; then
-    if [ -f "./aegis" ]; then
-        BINARY_NAME="./aegis"
-    else
-        echo "[X] Could not find or download precompiled binary."
-        echo "[X] Please install Go manually from https://go.dev/dl/"
-        exit 1
-    fi
-fi
-
-# Place binary in user bin directory
-INSTALL_DIR="$HOME/.local/bin"
-mkdir -p "$INSTALL_DIR"
-cp "$BINARY_NAME" "$INSTALL_DIR/aegis"
-chmod +x "$INSTALL_DIR/aegis"
-
-# Clean up downloaded binary from root directory if it's there
-if [ -f "./aegis" ] && [ "$INSTALL_DIR/aegis" != "./aegis" ]; then
-    rm -f "./aegis"
-fi
-
-# Check if INSTALL_DIR is in PATH, if not, append to bashrc/zshrc
-if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    echo "[!] Adding $INSTALL_DIR to PATH in shell profile..."
-    if [ -f "$HOME/.zshrc" ]; then
-        echo "export PATH=\$PATH:$INSTALL_DIR" >> "$HOME/.zshrc"
-        echo "[i] Added to ~/.zshrc. Please run 'source ~/.zshrc' or open a new terminal."
-    elif [ -f "$HOME/.bashrc" ]; then
-        echo "export PATH=\$PATH:$INSTALL_DIR" >> "$HOME/.bashrc"
-        echo "[i] Added to ~/.bashrc. Please run 'source ~/.bashrc' or open a new terminal."
-    else
-        echo "[i] Please add export PATH=\$PATH:$INSTALL_DIR to your shell profile."
-    fi
-fi
-
-echo "==================================================="
-echo "[✔] AEGIS SUCCESSFULLY INSTALLED (PRECOMPILED BINARY)!"
-echo "==================================================="
-echo "[i] You can run Aegis by typing: aegis"
-echo "[i] (You might need to restart your terminal or run: source ~/.bashrc or source ~/.zshrc)"
-echo "==================================================="
+aegis_install_dir="${AEGIS_INSTALL_DIR:-$HOME/.local/bin}"
+mkdir -p "$aegis_install_dir"
+install -m 0755 "$aegis_tmp/aegis" "$aegis_install_dir/aegis"
+echo "Installed: $aegis_install_dir/aegis"
+case ":$PATH:" in *":$aegis_install_dir:"*) ;; *) echo 'Add "$HOME/.local/bin" to PATH, or run ~/.local/bin/aegis.';; esac

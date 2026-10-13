@@ -1,8 +1,7 @@
 package crypto
 
-// BIP39Words contains the first 256 words of the standard BIP-39 English wordlist.
-// This is sufficient for deriving a 3-word Short Authentication String (SAS)
-// from 3 bytes of fingerprint XOR (values 0-255).
+// BIP39Words maps one byte to a word. Six bytes of the session transcript
+// digest produce a 48-bit optional comparison string.
 var BIP39Words = []string{
 	"abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd", "abuse",
 	"access", "accident", "account", "accuse", "achieve", "acid", "acoustic", "acquire", "across", "act",
