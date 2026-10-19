@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Aegis — Zero-Storage P2P Encrypted Terminal Messenger</title>
+<meta name="description" content="Temporary-name P2P encrypted messaging and file sharing for the terminal. Search and connect inside Aegis. Free and open source."/>
+<meta name="keywords" content="encrypted messenger,P2P,terminal,TUI,symmetric key chains,temporary sessions,secure file transfer,open source,Go"/>
+<meta property="og:title" content="Aegis"/>
+<meta property="og:description" content="Zero-trust, memory-only P2P secure terminal messenger. Free and open source."/>
+<meta property="og:url" content="https://rifatardarslan.github.io/Aegis/"/>
+<meta property="og:type" content="website"/>
+<meta name="twitter:card" content="summary"/>
+<meta name="twitter:title" content="Aegis"/>
+<meta name="twitter:description" content="Zero-trust, memory-only P2P secure terminal messenger. Free and open source."/>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2388C0D0' stroke-width='2'%3E%3Cpath d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/%3E%3C/svg%3E"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+:root{
+  --bg:#0b0f16;
+  --bg-raise:#10151f;
+  --bg-box:#131926;
+  --bg-darker:#080b11;
+  --line:rgba(216,222,233,.08);
+  --line-strong:rgba(216,222,233,.16);
+  --text:#d8dee9;
+  --text-dim:#8b93a7;
+  --text-faint:#4c566a;
+  --frost:#88c0d0;
+  --glacier:#81a1c1;
+  --gold:#ebcb8b;
+  --red:#bf616a;
+  --green:#a3be8c;
+  --radius:16px;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
+}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+::selection{background:rgba(136,192,208,.28)}
+a{color:inherit;text-decoration:none}
+.container{max-width:1120px;margin:0 auto;padding:0 24px}
+.grid>*,.split>*,.steps>*,.foot>*{min-width:0}
+.mono{font-family:var(--mono)}
+
+/* ── Nav ─────────────────────────────────────── */
+.nav{position:fixed;top:0;left:0;right:0;z-index:50;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);background:rgba(11,15,22,.78);border-bottom:1px solid var(--line)}
+.nav-inner{display:flex;align-items:center;justify-content:space-between;height:60px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:.02em}
+.brand svg{width:22px;height:22px;stroke:var(--frost)}
+.nav-links{display:flex;gap:26px;font-size:14px;color:var(--text-dim)}
+.nav-links a{transition:color .2s;cursor:pointer}
+.nav-links a:hover{color:var(--text)}
+.nav-cta{display:flex;align-items:center;gap:12px}
+.btn{display:inline-flex;align-items:center;gap:8px;font-size:14px;font-weight:600;border-radius:10px;padding:9px 18px;cursor:pointer;transition:background .2s,border-color .2s,color .2s;border:1px solid transparent}
+.btn svg{width:16px;height:16px}
+.btn-primary{background:var(--frost);color:#0b0f16}
+.btn-primary:hover{background:#9ed0de}
+.btn-ghost{border-color:var(--line-strong);color:var(--text)}
+.btn-ghost:hover{border-color:var(--frost);color:var(--frost)}
+.btn-lg{padding:13px 26px;font-size:15px;border-radius:12px}
+@media(max-width:820px){.nav-links{display:none}}
+
+/* ── Hero ────────────────────────────────────── */
+.hero{padding:150px 0 60px;position:relative}
+.hero::before{content:"";position:absolute;inset:0;background:
+  radial-gradient(ellipse 60% 45% at 50% 0%,rgba(136,192,208,.09),transparent 70%);pointer-events:none}
+.eyebrow{font-family:var(--mono);font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--frost);display:inline-flex;align-items:center;gap:8px;border:1px solid rgba(136,192,208,.25);border-radius:999px;padding:6px 14px;background:rgba(136,192,208,.06);max-width:100%}
+@media(max-width:480px){.eyebrow{font-size:11px;letter-spacing:.08em;white-space:normal}}
+.eyebrow .dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.hero h1{font-size:clamp(40px,6.4vw,68px);line-height:1.06;font-weight:700;letter-spacing:-.025em;margin:26px 0 20px}
+.hero h1 .accent{color:var(--frost)}
+.hero p.lede{max-width:640px;font-size:18px;color:var(--text-dim)}
+.hero-actions{display:flex;gap:14px;margin:32px 0 10px;flex-wrap:wrap}
+.hero-note{font-family:var(--mono);font-size:13px;color:var(--text-faint)}
+.hero-note b{color:var(--text-dim);font-weight:500}
+
+/* ── Terminal demo ───────────────────────────── */
+.term-wrap{margin-top:56px;position:relative}
+.term{border:1px solid var(--line-strong);border-radius:var(--radius);background:var(--bg-darker);overflow:hidden;box-shadow:0 30px 80px -20px rgba(0,0,0,.7),0 0 0 1px rgba(136,192,208,.04)}
+.term-bar{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--bg-raise)}
+.term-bar .dot{width:11px;height:11px;border-radius:50%}
+.term-bar .d1{background:var(--red)}.term-bar .d2{background:var(--gold)}.term-bar .d3{background:var(--green)}
+.term-bar .title{margin-left:10px;font-family:var(--mono);font-size:12px;color:var(--text-faint)}
+.term-body{font-family:var(--mono);font-size:13px;line-height:1.75;padding:20px 22px;min-height:430px;white-space:pre-wrap;word-break:break-word;
+  background-image:linear-gradient(to right,rgba(216,222,233,.025) 1px,transparent 1px),linear-gradient(to bottom,rgba(216,222,233,.025) 1px,transparent 1px);
+  background-size:32px 32px}
+.term-body .c-frost{color:var(--frost)}
+.term-body .c-glacier{color:var(--glacier)}
+.term-body .c-gold{color:var(--gold)}
+.term-body .c-green{color:var(--green)}
+.term-body .c-red{color:var(--red)}
+.term-body .c-dim{color:var(--text-faint)}
+.term-body .c-white{color:var(--text)}
+.term-body b{font-weight:700}
+.cursor{display:inline-block;width:8px;height:15px;background:var(--frost);vertical-align:-2px;animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+@media(max-width:640px){.term-body{font-size:11px;min-height:380px;padding:14px}}
+
+/* ── Sections ────────────────────────────────── */
+section{padding:96px 0}
+.sec-label{font-family:var(--mono);font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--frost);margin-bottom:14px}
+.sec-title{font-size:clamp(28px,4vw,42px);font-weight:700;letter-spacing:-.02em;line-height:1.15;margin-bottom:16px}
+.sec-sub{font-size:17px;color:var(--text-dim);max-width:640px}
+
+/* Feature grid */
+.grid{display:grid;gap:18px;margin-top:48px}
+.grid-3{grid-template-columns:repeat(3,1fr)}
+.grid-2{grid-template-columns:repeat(2,1fr)}
+.grid-4{grid-template-columns:repeat(4,1fr)}
+@media(max-width:900px){.grid-3,.grid-4{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.grid-3,.grid-2,.grid-4{grid-template-columns:1fr}}
+.card{border:1px solid var(--line);border-radius:var(--radius);background:var(--bg-box);padding:26px;transition:border-color .2s,background .2s}
+.card:hover{border-color:rgba(136,192,208,.3);background:#151c2b}
+.card .icon{width:40px;height:40px;border-radius:10px;background:rgba(136,192,208,.09);border:1px solid rgba(136,192,208,.18);display:flex;align-items:center;justify-content:center;margin-bottom:18px}
+.card .icon svg{width:20px;height:20px;stroke:var(--frost)}
+.card h3{font-size:17px;font-weight:600;margin-bottom:8px}
+.card p{font-size:14.5px;color:var(--text-dim)}
+.card .tag{display:inline-block;font-family:var(--mono);font-size:11px;color:var(--frost);background:rgba(136,192,208,.08);border:1px solid rgba(136,192,208,.16);border-radius:6px;padding:2px 8px;margin-top:14px;margin-right:6px}
+
+/* Split sections */
+.split{display:grid;grid-template-columns:1fr 1fr;gap:56px;align-items:center;margin-top:48px}
+@media(max-width:900px){.split{grid-template-columns:1fr}}
+.mock{border:1px solid var(--line-strong);border-radius:var(--radius);background:var(--bg-darker);overflow:hidden;
+  background-image:linear-gradient(to right,rgba(216,222,233,.03) 1px,transparent 1px),linear-gradient(to bottom,rgba(216,222,233,.03) 1px,transparent 1px);
+  background-size:28px 28px;padding:28px;font-family:var(--mono)}
+.mock-warn{border-color:rgba(235,203,139,.35)}
+.mock .mtitle{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);display:flex;align-items:center;gap:8px;margin-bottom:20px}
+.mock .mtitle svg{width:15px;height:15px;stroke:var(--gold)}
+.fp{font-size:12px;color:var(--text-dim);background:rgba(216,222,233,.04);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px;overflow-x:auto;white-space:nowrap}
+.fp .who{color:var(--glacier);margin-right:8px}
+.sas{display:flex;gap:10px;justify-content:center;margin:26px 0;flex-wrap:wrap}
+.sas span{font-size:clamp(15px,2.4vw,22px);font-weight:700;letter-spacing:.1em;color:var(--gold);border:1px solid rgba(235,203,139,.3);background:rgba(235,203,139,.06);border-radius:10px;padding:10px 18px}
+.sas .sep{border:none;background:none;color:var(--text-faint);padding:10px 0}
+.yn{display:flex;gap:14px;justify-content:center;font-size:13px}
+.yn span{padding:7px 16px;border-radius:8px;border:1px solid var(--line-strong)}
+.yn .y{color:var(--green);border-color:rgba(163,190,140,.4)}
+.yn .n{color:var(--red);border-color:rgba(191,97,106,.35)}
+
+/* Transfer mock */
+.xfer-row{display:flex;justify-content:space-between;font-size:12.5px;color:var(--text-dim);padding:8px 0;border-bottom:1px dashed var(--line)}
+.xfer-row:last-child{border-bottom:none}
+.xfer-row .ok{color:var(--green)}
+.pbar{height:10px;border-radius:6px;background:rgba(216,222,233,.06);border:1px solid var(--line);overflow:hidden;margin:18px 0 8px}
+.pbar i{display:block;height:100%;width:0%;background:linear-gradient(90deg,var(--glacier),var(--frost));border-radius:6px;animation:fill 3.2s ease-in-out infinite}
+@keyframes fill{0%{width:4%}70%{width:100%}100%{width:100%}}
+.pmeta{display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-faint)}
+
+/* Steps */
+.steps{display:grid;grid-template-columns:repeat(2,1fr);gap:18px;margin-top:48px}
+@media(max-width:820px){.steps{grid-template-columns:1fr}}
+.step{border:1px solid var(--line);border-radius:var(--radius);background:var(--bg-box);padding:26px}
+.step .num{font-family:var(--mono);font-size:13px;color:var(--frost);border:1px solid rgba(136,192,208,.25);border-radius:8px;padding:3px 10px;display:inline-block;margin-bottom:16px}
+.step h3{font-size:16.5px;font-weight:600;margin-bottom:8px}
+.step p{font-size:14.5px;color:var(--text-dim)}
+.step code{font-family:var(--mono);font-size:12.5px;color:var(--frost);background:rgba(136,192,208,.08);border-radius:6px;padding:2px 7px}
+.step kbd{font-family:var(--mono);font-size:11.5px;color:var(--text);background:rgba(216,222,233,.08);border:1px solid var(--line-strong);border-bottom-width:2px;border-radius:6px;padding:2px 7px}
+
+/* Threat table */
+.ttable{margin-top:48px;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.trow{display:grid;grid-template-columns:280px 1fr;border-bottom:1px solid var(--line);background:var(--bg-box)}
+.trow:last-child{border-bottom:none}
+.trow:hover{background:#151c2b}
+.trow .threat{padding:20px 24px;border-right:1px solid var(--line);display:flex;align-items:center;gap:12px;font-weight:600;font-size:14.5px}
+.trow .threat svg{width:17px;height:17px;stroke:var(--red);flex-shrink:0}
+.trow .mit{padding:20px 24px;font-size:14px;color:var(--text-dim)}
+@media(max-width:720px){.trow{grid-template-columns:1fr}.trow .threat{border-right:none;border-bottom:1px dashed var(--line);padding-bottom:12px}.trow .mit{padding-top:12px}}
+
+/* Install */
+.install-clone{margin-top:48px}
+.codeblock{position:relative;border:1px solid var(--line-strong);border-radius:12px;background:var(--bg-darker);font-family:var(--mono);font-size:13.5px;padding:18px 20px;overflow-x:auto}
+.codeblock .cm{color:var(--text-faint)}
+.codeblock .cmd{color:var(--text)}
+.codeblock .cmd::before{content:"$ ";color:var(--green)}
+.copybtn{position:absolute;top:10px;right:10px;background:var(--bg-raise);border:1px solid var(--line-strong);border-radius:8px;color:var(--text-dim);font-family:var(--sans);font-size:12px;padding:6px 12px;cursor:pointer;transition:color .2s,border-color .2s}
+.copybtn:hover{color:var(--frost);border-color:var(--frost)}
+.plat{display:flex;flex-direction:column;gap:0}
+.plat .icon{width:44px;height:44px;border-radius:12px;background:rgba(136,192,208,.09);border:1px solid rgba(136,192,208,.18);display:flex;align-items:center;justify-content:center;margin-bottom:18px}
+.plat .icon svg{width:22px;height:22px;stroke:var(--frost)}
+.plat h3{font-size:17px;font-weight:600;margin-bottom:6px}
+.plat .sub{font-size:13.5px;color:var(--text-dim);margin-bottom:16px}
+.plat .codeblock{margin-top:auto;font-size:12.5px;padding:13px 16px}
+.flags{margin-top:22px;font-family:var(--mono);font-size:13px;color:var(--text-dim)}
+.flags div{padding:10px 0;border-bottom:1px dashed var(--line);display:flex;gap:18px;flex-wrap:wrap}
+.flags div:last-child{border-bottom:none}
+.flags code{color:var(--frost);min-width:190px}
+
+/* Footer */
+footer{border-top:1px solid var(--line);padding:56px 0 40px;background:var(--bg-darker)}
+.foot{display:grid;grid-template-columns:2fr 1fr 1fr;gap:40px}
+@media(max-width:720px){.foot{grid-template-columns:1fr}}
+.foot .brand{margin-bottom:12px}
+.foot p{font-size:14px;color:var(--text-dim);max-width:320px}
+.foot h4{font-size:13px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-faint);margin-bottom:16px;font-family:var(--mono)}
+.foot ul{list-style:none;display:flex;flex-direction:column;gap:10px;font-size:14px;color:var(--text-dim)}
+.foot ul a{transition:color .2s}
+.foot ul a:hover{color:var(--frost)}
+.foot-bottom{margin-top:48px;padding-top:24px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--text-faint);font-family:var(--mono)}
+
+/* reveal on scroll */
+.reveal{opacity:0;transform:translateY(18px);transition:opacity .6s ease,transform .6s ease}
+.reveal.in{opacity:1;transform:none}
+@media (prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none}}
+
+:focus-visible{outline:2px solid var(--frost);outline-offset:2px;border-radius:6px}
+</style>
+</head>
+<body>
+
+<!-- ═══ NAV ═══ -->
+<nav class="nav">
+  <div class="container nav-inner">
+    <a class="brand" href="#" aria-label="Aegis home">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      AEGIS
+    </a>
+    <div class="nav-links">
+      <a href="#security">Security</a>
+      <a href="#verify">Verify</a>
+      <a href="#transfer">Transfer</a>
+      <a href="#network">Network</a>
+      <a href="#threats">Threat Model</a>
+      <a href="#install">Install</a>
+    </div>
+    <div class="nav-cta">
+      <a class="btn btn-ghost" href="https://github.com/rifatardarslan/Aegis" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.55v-2.15c-3.2.7-3.87-1.36-3.87-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.75 2.69 1.25 3.34.95.11-.74.4-1.25.73-1.53-2.55-.29-5.23-1.28-5.23-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.78 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.25 5.67.41.35.78 1.05.78 2.12v3.14c0 .3.21.66.8.55A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+        Star
+      </a>
+      <a class="btn btn-primary" href="#install">Install</a>
+    </div>
+  </div>
+</nav>
+
+<!-- ═══ HERO ═══ -->
+<header class="hero">
+  <div class="container">
+    <span class="eyebrow"><span class="dot"></span>Temporary-name P2P terminal messenger</span>
+    <h1>Encrypt. Verify.<br/><span class="accent">Vanish.</span></h1>
+    <p class="lede">Aegis is a temporary-session, peer-to-peer encrypted messenger and file transfer tool that lives entirely in your terminal. Temporary names, in-app search and explicit connection requests — a free and open alternative to trusting someone else's infrastructure.</p>
+    <div class="hero-actions">
+      <a class="btn btn-primary btn-lg" href="#install">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Install Aegis
+      </a>
+      <a class="btn btn-ghost btn-lg" href="https://github.com/rifatardarslan/Aegis" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.55v-2.15c-3.2.7-3.87-1.36-3.87-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.75 2.69 1.25 3.34.95.11-.74.4-1.25.73-1.53-2.55-.29-5.23-1.28-5.23-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.78 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.25 5.67.41.35.78 1.05.78 2.12v3.14c0 .3.21.66.8.55A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+        View on GitHub
+      </a>
+    </div>
+    <p class="hero-note"><b>Windows · Linux · macOS</b> — written in Go, MIT licensed</p>
+
+    <!-- live terminal demo -->
+    <div class="term-wrap">
+      <div class="term" role="img" aria-label="Animated demo of an Aegis terminal session: temporary name selection, in-app search, request acceptance and encrypted chat">
+        <div class="term-bar">
+          <span class="dot d1"></span><span class="dot d2"></span><span class="dot d3"></span>
+          <span class="title">aegis — zero-trust session</span>
+        </div>
+        <div class="term-body" id="termBody"></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ═══ SECURITY FEATURES ═══ -->
+<section id="security">
+  <div class="container">
+    <div class="reveal">
+      <div class="sec-label">Cryptography layer</div>
+      <h2 class="sec-title">Encrypted conversations with explicit limits</h2>
+      <p class="sec-sub">Ephemeral identities, authenticated packets and per-message keys. Temporary names are discovery labels, not proof of personal identity.</p>
+    </div>
+    <div class="grid grid-3">
+      <div class="card reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg></div>
+        <h3>Symmetric Key Chains</h3>
+        <p>HKDF-SHA256 chains derive a separate key for each message. This is not the full Signal Double Ratchet; compromise of a current chain key exposes future messages on that chain.</p>
+        <span class="tag">HKDF-SHA256</span><span class="tag">Forward secrecy</span>
+      </div>
+      <div class="card reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+        <h3>ChaCha20-Poly1305 AEAD</h3>
+        <p>Payloads are sealed and authenticated with modern AEAD. Nonces come from monotonic counters, and associated data binds both peer IDs — replayed or spoofed packets are rejected on arrival.</p>
+        <span class="tag">Anti-replay</span><span class="tag">Authenticated</span>
+      </div>
+      <div class="card reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a5 5 0 0 1 5 5c0 1.5-.5 2.5-1.5 3.5L21 16v3h-3l-1.5-1.5L15 19h-3v-3l-4.5-4.5C6.5 10.5 7 9.5 7 7a5 5 0 0 1 5-5z" transform="rotate(90 12 12)"/><circle cx="9" cy="9" r="1"/></svg></div>
+        <h3>Ephemeral Identity</h3>
+        <p>Each conversation uses random libp2p and application identities. Choose a temporary display name without an account or password. Discovery and connection metadata can remain visible to network infrastructure.</p>
+        <span class="tag">Random identity</span><span class="tag">Ed25519</span>
+      </div>
+      <div class="card reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20H7L3 16c-.6-.6-.6-1.5 0-2.1L13 4l7 7-8.9 8.9"/><path d="M6 11l7 7"/></svg></div>
+        <h3>Best-effort Cleanup</h3>
+        <p>Owned application key and file byte buffers are cleared on orderly close. Go, libraries and operating systems can retain copies; complete forensic erasure is not guaranteed.</p>
+        <span class="tag">Owned buffers</span><span class="tag">KeepAlive</span>
+      </div>
+      <div class="card reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="5" y1="3" x2="19" y2="21"/></svg></div>
+        <h3>Zero Storage</h3>
+        <p>No application chat database, configuration file or disk debug log. Files are written only when saved. Terminals, swap and crash dumps may retain information.</p>
+        <span class="tag">RAM-only</span><span class="tag">No persistence</span>
+      </div>
+      <div class="card reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/><line x1="4" y1="4" x2="20" y2="20"/></svg></div>
+        <h3>Optional Fingerprint Comparison</h3>
+        <p>Fingerprints and six transcript-derived words are available in chat. Independent trusted comparison is optional; matching usernames alone do not verify a person.</p>
+        <span class="tag">SAS</span><span class="tag">BIP-39</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ VERIFY ═══ -->
+<section id="verify" style="background:var(--bg-raise);border-top:1px solid var(--line);border-bottom:1px solid var(--line)">
+  <div class="container">
+    <div class="split">
+      <div class="reveal">
+        <div class="sec-label">Optional independent comparison</div>
+        <h2 class="sec-title">Connect inside Aegis.<br/>Inspect fingerprints when needed.</h2>
+        <p class="sec-sub" style="margin-bottom:22px">Find the other person by temporary name and accept a connection request. No external app is required to exchange addresses. F2 in chat opens fingerprint details.</p>
+        <p class="sec-sub">The comparison words derive from the authenticated session transcript. Use an independent trusted means if you need person-level verification; the connection itself cannot prove a real-world identity.</p>
+      </div>
+      <div class="mock mock-warn reveal" role="img" aria-label="Aegis identity verification panel showing fingerprints and six comparison words">
+        <div class="mtitle">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          Optional session details
+        </div>
+        <div class="fp"><span class="who">local </span>SHA256:aXolC9KtN2mE7rV4qLuJ8sWzYbD1fGhPcT5xKvRnM3o</div>
+        <div class="fp"><span class="who">remote</span>SHA256:pQw8ZxCv2BnM4kLj6HgF1dSa9YtR3eUi7oXcVbN5mKw</div>
+        <div class="sas" aria-label="Optional transcript comparison words">
+          <span>ABANDON · ABLE · ABOUT<br/>ABOVE · ABSENT · ABSORB</span>
+        </div>
+        <div class="yn"><span class="y">[F2] View session details</span><span class="n">[Esc] Disconnect</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ TRANSFER ═══ -->
+<section id="transfer">
+  <div class="container">
+    <div class="split">
+      <div class="mock reveal" style="order:1" role="img" aria-label="Aegis file transfer panel showing an encrypted transfer with progress bar and hash verification">
+        <div class="mtitle" style="color:var(--frost)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="var(--frost)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          Secure file transfer
+        </div>
+        <div class="xfer-row"><span>schematics.pdf</span><span>2.4 MB · 10 chunks</span></div>
+        <div class="xfer-row"><span>cipher</span><span>ChaCha20-Poly1305</span></div>
+        <div class="xfer-row"><span>chunk hash</span><span class="ok">SHA-256 ✓ per 256 KB</span></div>
+        <div class="xfer-row"><span>assembly</span><span>RAM only — no temp files</span></div>
+        <div class="pbar" aria-hidden="true"><i></i></div>
+        <div class="pmeta"><span>encrypted stream /aegis/2.0.0</span><span>explicit save · Unix mode 0600</span></div>
+      </div>
+      <div class="reveal" style="order:2">
+        <div class="sec-label">Multiplexed file transfer</div>
+        <h2 class="sec-title">Files that never touch disk in transit</h2>
+        <p class="sec-sub" style="margin-bottom:22px">Drag a file into the terminal — or hit <b>Ctrl+F</b> for the built-in browser — and it streams over the same encrypted libp2p session as your chat. Files are split into 256 KB chunks, each hashed with SHA-256 as it flows.</p>
+        <p class="sec-sub">The receiver assembles everything in RAM, independently recomputes the full hash, and rejects the transfer on any mismatch — zeroizing the buffer. Saving uses a private staging file and overwrite confirmation, with Unix owner-only <span class="mono" style="color:var(--frost)">0600</span> permissions.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ NETWORK ═══ -->
+<section id="network" style="background:var(--bg-raise);border-top:1px solid var(--line);border-bottom:1px solid var(--line)">
+  <div class="container">
+    <div class="reveal">
+      <div class="sec-label">P2P routing &amp; NAT traversal</div>
+      <h2 class="sec-title">Peer-to-peer with discovery and relay infrastructure.</h2>
+      <p class="sec-sub">Aegis runs on a fully decentralized topology over TCP and QUIC, multiplexed with Yamux. Messages are encrypted between peers. Public discovery and relay infrastructure can observe connection metadata.</p>
+    </div>
+    <div class="grid grid-4">
+      <div class="card reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="2"/><circle cx="4" cy="5" r="2"/><circle cx="20" cy="5" r="2"/><circle cx="4" cy="19" r="2"/><circle cx="20" cy="19" r="2"/><path d="M5.7 6.4 10.3 10.6M18.3 6.4 13.7 10.6M5.7 17.6 10.3 13.4M18.3 17.6 13.7 13.4"/></svg></div>
+        <h3>Kademlia DHT</h3>
+        <p>Peers resolve globally through distributed hash table routing anchored on bootstrap nodes.</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg></div>
+        <h3>mDNS Discovery</h3>
+        <p>Peers on the same LAN use multicast DNS and live profile checks for name-based discovery.</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
+        <h3>NAT Hole Punching</h3>
+        <p>AutoNAT and DCUtR attempt direct connectivity where the network permits it; restrictive NAT may require a relay.</p>
+      </div>
+      <div class="card reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 2.1l4 4-4 4"/><path d="M3 12.2v-2a4 4 0 0 1 4-4h12.8"/><path d="M7 21.9l-4-4 4-4"/><path d="M21 11.8v2a4 4 0 0 1-4 4H4.2"/></svg></div>
+        <h3>Relay Fallback</h3>
+        <p>Automatic circuit relays via public IPFS nodes when direct paths fail — still end-to-end encrypted. Bring your own with <code class="mono" style="font-size:12px;color:var(--frost)">--relay</code>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ HOW IT WORKS ═══ -->
+<section id="how">
+  <div class="container">
+    <div class="reveal">
+      <div class="sec-label">Live walkthrough</div>
+      <h2 class="sec-title">From cold terminal to secure channel in four steps</h2>
+    </div>
+    <div class="steps">
+      <div class="step reveal">
+        <span class="num">01</span>
+        <h3>Choose a temporary name</h3>
+        <p>Run <code>aegis</code> and choose a temporary name. Random session identities are generated without a password.</p>
+      </div>
+      <div class="step reveal">
+        <span class="num">02</span>
+        <h3>Connect</h3>
+        <p>Search the other person by name inside Aegis. Matching live profiles appear separately, including duplicate names.</p>
+      </div>
+      <div class="step reveal">
+        <span class="num">03</span>
+        <h3>Accept the request</h3>
+        <p>The recipient accepts with <kbd>Y</kbd> or rejects with <kbd>N</kbd>. Requests expire after 60 seconds.</p>
+      </div>
+      <div class="step reveal">
+        <span class="num">04</span>
+        <h3>Chat, transfer, close</h3>
+        <p>Exchange encrypted messages, choose files with <kbd>Ctrl+F</kbd> and save with <kbd>Ctrl+S</kbd>. Unsaved files are identified before interactive close.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ THREAT MODEL ═══ -->
+<section id="threats" style="background:var(--bg-raise);border-top:1px solid var(--line);border-bottom:1px solid var(--line)">
+  <div class="container">
+    <div class="reveal">
+      <div class="sec-label">Threat model</div>
+      <h2 class="sec-title">Designed against real adversaries</h2>
+      <p class="sec-sub">Every mitigation maps to a concrete attack. This is the model Aegis is built and tested against.</p>
+    </div>
+    <div class="ttable reveal">
+      <div class="trow">
+        <div class="threat"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>Passive eavesdropping</div>
+        <div class="mit">Double-encrypted wire transport — Yamux streams over TLS 1.3 QUIC, payloads sealed with ChaCha20-Poly1305.</div>
+      </div>
+      <div class="trow">
+        <div class="threat"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="17" y1="8" x2="22" y2="13"/><line x1="22" y1="8" x2="17" y2="13"/></svg>Active man-in-the-middle</div>
+        <div class="mit">Authenticated transport identities and session-bound signatures. Person-level verification requires optional independent fingerprint/word comparison.</div>
+      </div>
+      <div class="trow">
+        <div class="threat"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>Replay &amp; spoofing</div>
+        <div class="mit">Monotonic packet counters bound to unique AEAD nonces. Unsigned or duplicate-sequence packets are rejected.</div>
+      </div>
+      <div class="trow">
+        <div class="threat"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>Key compromise</div>
+        <div class="mit">Ephemeral signing keys and per-message symmetric chains. No in-session recovery after a chain-key compromise.</div>
+      </div>
+      <div class="trow">
+        <div class="threat"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>Cold-boot forensics</div>
+        <div class="mit">Owned byte buffers are cleared on orderly close; runtime copies, swap and forensic erasure are outside the guarantee.</div>
+      </div>
+      <div class="trow">
+        <div class="threat"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M8 12h8"/><path d="M12 8v8"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2" opacity=".4"/></svg>Predictable identity</div>
+        <div class="mit">No master passphrase is required. Each conversation generates random keys.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ INSTALL ═══ -->
+<section id="install">
+  <div class="container">
+    <div class="reveal">
+      <div class="sec-label">Getting started</div>
+      <h2 class="sec-title">Install Aegis</h2>
+      <p class="sec-sub">One command per platform. The installer checks for Go, installs it via your package manager if missing, or falls back to a precompiled release binary.</p>
+    </div>
+
+    <div class="install-clone reveal">
+      <div class="codeblock">
+        <button class="copybtn" data-copy="git clone https://github.com/rifatardarslan/Aegis.git&#10;cd Aegis" aria-label="Copy clone commands">Copy</button>
+        <div class="cm"># clone the repository</div>
+        <div class="cmd">git clone https://github.com/rifatardarslan/Aegis.git</div>
+        <div class="cmd">cd Aegis</div>
+      </div>
+    </div>
+
+    <div class="grid grid-2">
+      <div class="card plat reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="1"/><rect x="13" y="3" width="8" height="8" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/><rect x="13" y="13" width="8" height="8" rx="1"/></svg></div>
+        <h3>Windows</h3>
+        <p class="sub">Checks Go, auto-installs via winget, falls back to a precompiled <span class="mono">aegis.exe</span> from Releases, and wires up your PATH.</p>
+        <div class="codeblock">
+          <button class="copybtn" data-copy=".\install.bat" aria-label="Copy Windows install command">Copy</button>
+          <div class="cm"># double-click, or from a terminal:</div>
+          <div class="cmd">.\install.bat</div>
+        </div>
+      </div>
+      <div class="card plat reveal">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div>
+        <h3>Linux &amp; macOS</h3>
+        <p class="sub">Works with apt-get, Homebrew, dnf and pacman. Installs to <span class="mono">~/.local/bin</span> and adds it to your shell startup configuration. Open a new terminal to run aegis.</p>
+        <div class="codeblock">
+          <button class="copybtn" data-copy="chmod +x install.sh&#10;./install.sh" aria-label="Copy Linux and macOS install commands">Copy</button>
+          <div class="cm"># run the installer:</div>
+          <div class="cmd">chmod +x install.sh</div>
+          <div class="cmd">./install.sh</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="reveal" style="margin-top:40px">
+      <h3 style="font-size:16px;font-weight:600;margin-bottom:4px">Then just run it</h3>
+      <div class="codeblock" style="margin-top:14px;max-width:480px">
+        <button class="copybtn" data-copy="aegis" aria-label="Copy run command">Copy</button>
+        <div class="cmd">aegis</div>
+      </div>
+      <div class="flags">
+        <div><code>--debug</code><span>Fixed diagnostic categories on stderr; no disk debug log</span></div>
+        <div><code>--relay "&lt;multiaddr&gt;"</code><span>Prefer a custom circuit relay alongside public bootstrap/relay candidates</span></div>
+      </div>
+      <p style="margin-top:28px;font-size:14px;color:var(--text-dim)">
+        <a href="https://github.com/rifatardarslan/Aegis/releases" target="_blank" rel="noopener" style="color:var(--frost)">View all releases on GitHub →</a>
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ FOOTER ═══ -->
+<footer>
+  <div class="container">
+    <div class="foot">
+      <div>
+        <a class="brand" href="#" aria-label="Aegis home">
+          <svg viewBox="0 0 24 24" fill="none" stroke="var(--frost)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:20px;height:20px"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          AEGIS
+        </a>
+        <p>Zero-trust, memory-only P2P secure terminal messenger. Temporary conversations with no persistent chat database — free and open source.</p>
+      </div>
+      <div>
+        <h4>Product</h4>
+        <ul>
+          <li><a href="#security">Security</a></li>
+          <li><a href="#verify">Verification</a></li>
+          <li><a href="#transfer">File Transfer</a></li>
+          <li><a href="#network">Network</a></li>
+          <li><a href="#install">Install</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Resources</h4>
+        <ul>
+          <li><a href="https://github.com/rifatardarslan/Aegis" target="_blank" rel="noopener">Source Code</a></li>
+          <li><a href="https://github.com/rifatardarslan/Aegis/releases" target="_blank" rel="noopener">Releases</a></li>
+          <li><a href="https://github.com/rifatardarslan/Aegis/blob/main/SECURITY.md" target="_blank" rel="noopener">Security Policy</a></li>
+          <li><a href="https://github.com/rifatardarslan/Aegis/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a></li>
+          <li><a href="https://github.com/rifatardarslan/Aegis/issues" target="_blank" rel="noopener">Issues</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>© 2026 Aegis. Open source under MIT license.</span>
+      <span>ZERO-TRUST · MEMORY-ONLY · P2P</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+/* ── terminal demo animation ─────────────────── */
+(function(){
+  var body = document.getElementById('termBody');
+  var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // each step: [html, delayAfterMs, typewriter?]
+  var script = [
+    ['<span class="c-green">$</span> <span class="c-white">aegis</span>', 600, true],
+    ['<span class="c-frost"><b>    ___    ______  ______  ____  _____\n   /   |  / ____/ / ____/ /  _/ / ___/\n  / /| | / __/   / / __   / /   \\__ \\ \n / ___ |/ /___  / /_/ / _/ /   ___/ / \n/_/  |_/_____/  \\____/ /___/  /____/  </b></span>', 300, false],
+    ['<span class="c-dim">ZERO-TRUST  ·  MEMORY-ONLY  ·  P2P SECURE TERMINAL</span>\n', 700, false],
+    ['<span class="c-glacier">◆ Temporary name:</span> <span class="c-frost">alice</span>', 800, true],
+    ['<span class="c-green">✓</span> <span class="c-dim">Random identity ready · findable by name</span>', 900, false],
+    ['<span class="c-glacier">◆ Search a person:</span> <span class="c-white">ghost</span>', 700, true],
+    ['<span class="c-dim">Searching local peers and name-specific DHT records…</span>', 900, false],
+    ['<span class="c-green">✓</span> <span class="c-white">ghost found · connection request sent</span>', 800, false],
+    ['<span class="c-green">✓</span> <span class="c-white">Request accepted · encrypted session established</span>', 900, false],
+    ['<span class="c-dim">[14:02]</span> <span class="c-frost"><b>you</b></span>   <span class="c-white">payload secured. sending schematics.</span>', 800, true],
+    ['<span class="c-dim">[14:03]</span> <span class="c-green"><b>ghost</b></span> <span class="c-white">receiving. hash checks out on my end ✓</span>', 900, false],
+    ['<span class="c-dim">▸ schematics.pdf · 2.4 MB</span> <span class="c-frost">[══════════▶] 100%</span> <span class="c-green">SHA-256 OK · saved 0600</span>\n', 1100, false],
+    ['<span class="c-dim">encrypted message exchange · temporary session · chat database: none</span>', 2600, false]
+  ];
+
+  var lines = [];
+  var cur = '<span class="cursor" aria-hidden="true"></span>';
+
+  function render(extra){
+    body.innerHTML = lines.join('\n') + (extra||'') + cur;
+  }
+
+  function typewriter(html, done){
+    // type only the visible text of the last text node region: simpler — reveal chars of plain segments
+    var tmp = document.createElement('div'); tmp.innerHTML = html;
+    var full = tmp.textContent;
+    var i = 0;
+    var span = '<span class="c-white">';
+    function tick(){
+      i += Math.max(1, Math.round(full.length/28));
+      if(i >= full.length){ lines.push(html); render(); done(); return; }
+      render(span + escapeHtml(full.slice(0,i)) + '</span>');
+      setTimeout(tick, 34);
+    }
+    tick();
+  }
+
+  function escapeHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+  function play(idx){
+    if(idx >= script.length){
+      setTimeout(function(){ lines = []; render(); setTimeout(function(){ play(0); }, 500); }, 400);
+      return;
+    }
+    var step = script[idx];
+    var next = function(){ setTimeout(function(){ play(idx+1); }, step[1]); };
+    if(step[2] && !reduced){ typewriter(step[0], next); }
+    else { lines.push(step[0]); render(); next(); }
+  }
+
+  if(reduced){
+    lines = script.map(function(s){ return s[0]; });
+    render();
+  } else {
+    render();
+    setTimeout(function(){ play(0); }, 600);
+  }
+})();
+
+/* ── copy buttons ────────────────────────────── */
+document.querySelectorAll('.copybtn').forEach(function(btn){
+  btn.addEventListener('click', function(){
+    var text = btn.getAttribute('data-copy');
+    function ok(){ btn.textContent = 'Copied!'; setTimeout(function(){ btn.textContent = 'Copy'; }, 1600); }
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(ok, function(){ fallback(); });
+    } else { fallback(); }
+    function fallback(){
+      var ta = document.createElement('textarea');
+      ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+      document.body.appendChild(ta); ta.select();
+      try{ document.execCommand('copy'); ok(); }catch(e){}
+      document.body.removeChild(ta);
+    }
+  });
+});
+
+/* ── reveal on scroll ────────────────────────── */
+(function(){
+  var els = document.querySelectorAll('.reveal');
+  if(!('IntersectionObserver' in window)){ els.forEach(function(e){ e.classList.add('in'); }); return; }
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(en){ if(en.isIntersecting){ en.target.classList.add('in'); io.unobserve(en.target); } });
+  }, {threshold:.12});
+  els.forEach(function(e){ io.observe(e); });
+})();
+</script>
+</body>
+</html>
